@@ -8,6 +8,8 @@ import AetherLibavutil
 /// `MP4SegmentMuxer` writing into `SegmentCache`. Forward-only; backward
 /// scrubs restart with a new instance at a non-zero `baseIndex`.
 final class HLSSegmentProducer: @unchecked Sendable {
+    // SVPlayer modification: observe source packets before the HLS audio bridge or muxer.
+    var speechPackets: AudioPacketWindow?
 
     /// Per-stream codec config carried from `HLSVideoEngine` into the muxer setup.
     struct StreamConfig {
@@ -2103,6 +2105,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
             category: .session)
         audioFollowPreviouslyBound.insert(audio.sourceStreamIndex)
         audioConfig?.sourceStreamIndex = candidate
+        demuxer.withStream(at: candidate) { stream in
+            speechPackets?.configure(stream: stream, epoch: epoch)
+        }
         lastGenuineAudioSourceDts = Int64.min
         audioPacketsSinceGenuineDts = 0
         audioFollowCandidate = nil
@@ -4558,6 +4563,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     lastRawVideoPts = rawPts
                 }
 
+                // SVPlayer modification: the displayed item's audio PTS plus its source shift is
+                // the engine's source clock, including side renditions and sequential archive seams.
+                if isAudioPkt, let audio = audioConfig, let speechPackets {
+                    let sourceShift = !foldsSequentialTimeline && videoShiftPts != Int64.min
+                        ? av_rescale_q(videoShiftPts, sourceVideoTimeBase, audio.sourceTimeBase) : 0
+                    let offset = audioShiftPts != Int64.min
+                        ? SourceTimestampBounds.difference(sourceShift, audioShiftPts) : 0
+                    speechPackets.append(packet, offset: offset, epoch: epoch)
+                }
                 let activeShift: Int64 = isVideoPkt ? videoShiftPts : audioShiftPts
                 if activeShift != Int64.min && activeShift != 0 {
                     if packet.pointee.dts != Int64.min {
@@ -4974,6 +4988,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // Before the report: a live in-place rebuild starts from it on this producer's demuxer, and
         // the defer that also stops the watchdog runs only after this returns.
         stopNoCutWatchdog()
+        if !isLive, case .eof = exitReason { speechPackets?.finish(epoch: epoch) }
         onPumpFinished?(exitReason)
     }
 

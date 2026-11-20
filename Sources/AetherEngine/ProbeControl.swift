@@ -62,6 +62,13 @@ public final class ProbeCancellation: @unchecked Sendable {
 
     public var isCancelled: Bool { lock.withLock { cancelled } }
 
+    func withInterruption<Value>(_ interrupt: @escaping @Sendable () -> Void,
+                                 _ body: () throws -> Value) rethrows -> Value {
+        let id = register(ProbeInterruption(interrupt))
+        defer { remove(id) }
+        return try body()
+    }
+
     public func cancel() {
         let pending = lock.withLock {
             cancelled = true

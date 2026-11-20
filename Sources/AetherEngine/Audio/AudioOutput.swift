@@ -36,6 +36,14 @@ final class AudioOutput: @unchecked Sendable {
     /// renderer. Guarded because the host writes it from the main actor while the demux thread reads
     /// it in `enqueue`.
     private var presentationOffset: CMTime = .zero
+    private var enqueuedEnd = -Double.infinity
+
+    /// SVPlayer modification. End of the audio actually handed to the renderer, including lip-sync delay, on the source clock.
+    var enqueuedEndSeconds: Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return enqueuedEnd
+    }
 
     /// One line per offset change, not per buffer. Reset by `setPresentationOffset`.
     private var loggedOffsetInEffect = false
@@ -163,6 +171,7 @@ final class AudioOutput: @unchecked Sendable {
                 _automaticFlushCount += 1
                 let count = _automaticFlushCount
                 renderer.flush()
+                enqueuedEnd = -.infinity
                 lock.unlock()
                 EngineLog.emit(
                     "[AudioOutput] AE#549 renderer flushed itself (#\(count)): "
@@ -360,6 +369,10 @@ final class AudioOutput: @unchecked Sendable {
                 + String(format: " (sample at %.3fs delivered at %.3fs)", source, source + offset.seconds)
         }
         renderer.enqueue(delivered)
+        let deliveredPTS = timeline.sourceTime(forRenderer: CMSampleBufferGetPresentationTimeStamp(delivered)).seconds
+        let duration = CMSampleBufferGetDuration(delivered).seconds
+        let end = deliveredPTS + (duration.isFinite ? max(0, duration) : 0)
+        if end.isFinite { enqueuedEnd = max(enqueuedEnd, end) }
         #if DEBUG
         afterRendererEnqueueForTesting?()
         #endif
@@ -498,6 +511,7 @@ final class AudioOutput: @unchecked Sendable {
         defer { lock.unlock() }
         _clockCommandRevision &+= 1
         _epoch &+= 1
+        enqueuedEnd = -.infinity
         renderer.flush()
     }
 
@@ -506,6 +520,7 @@ final class AudioOutput: @unchecked Sendable {
         defer { lock.unlock() }
         _clockCommandRevision &+= 1
         _epoch &+= 1
+        enqueuedEnd = -.infinity
         playbackEnabled = false
         endPreroll()
         // Hosts discard the output after stop. An already-paused clock needs no time reset;

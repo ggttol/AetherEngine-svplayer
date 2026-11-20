@@ -16,6 +16,35 @@ enum SoftwareEndOfMediaClock {
     /// buy an unbounded runway on a session that is already over.
     static let maxTailPlayoutSeconds: TimeInterval = 5.0
 
+    /// SVPlayer modification. The render clock owns EOF while either renderer has queued media.
+    struct PendingTail {
+        let target: Double
+        private var lastClock: Double
+        private var lastAdvance: TimeInterval
+
+        init?(clock: Double, audioEnd: Double, videoPTS: Double?, now: TimeInterval) {
+            guard let end = [audioEnd, videoPTS ?? .nan].filter(\.isFinite).max() else { return nil }
+            let tail = SoftwareEndOfMediaClock.tailPlayoutSeconds(clockSeconds: clock, lastAudioPts: end)
+            guard tail > 0 else { return nil }
+            target = clock + tail
+            lastClock = clock
+            lastAdvance = now
+        }
+
+        mutating func resumed(now: TimeInterval) {
+            lastAdvance = now
+        }
+
+        mutating func shouldFinish(clock: Double, playing: Bool, now: TimeInterval) -> Bool {
+            guard playing else { return false }
+            if clock > lastClock {
+                lastClock = clock
+                lastAdvance = now
+            }
+            return clock >= target || now - lastAdvance >= SoftwareEndOfMediaClock.maxTailPlayoutSeconds
+        }
+    }
+
     /// Seconds to let the clock run before parking it: the decoded audio still ahead of the playhead,
     /// clamped. Zero (park now) when the source carries no audio, when its PTS is unusable, or when the
     /// clock has already passed it, which is the normal VOD case because the drain that precedes end of

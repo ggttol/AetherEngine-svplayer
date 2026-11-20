@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Seekable `IOReader` over a local file, backed by a `FileHandle`. Reads on
@@ -16,6 +17,20 @@ final class FileIOReader: IOReader, @unchecked Sendable {
         self.handle = h
         self.url = url
         self.size = sz ?? 0
+    }
+
+    /// A bounded scrub must not wait for a writer if the loaded file is replaced by a pipe.
+    init?(regularFile url: URL) {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else { return nil }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+            Darwin.close(descriptor)
+            return nil
+        }
+        handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        size = info.st_size
+        self.url = url
     }
 
     /// #243 (local twin of the HTTP disc reader): `FileHandle.read` hands back an NSData-backed

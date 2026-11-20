@@ -41,7 +41,8 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
     let format: IFrameRenditionFormat
     private let entries: [Entry]
     private let cache: IFramePayloadCache
-    private let readPayload: (Entry) -> Data?
+    private let readPayload: (Entry, ProbeCancellation?) -> Data?
+    private let refine: (Double, Int, ProbeCancellation) -> ScrubFrame?
     private let buildFragment: (Data, Int, Entry) -> IFrameFragmentBuilder.Output?
     private let waitForLink: (_ shouldStop: () -> Bool) -> Void
     private let sourceReadsAllowed: () -> Bool
@@ -59,7 +60,8 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
     init(entries: [Entry],
          cache: IFramePayloadCache,
          format: IFrameRenditionFormat = .keyframes,
-         readPayload: @escaping (Entry) -> Data?,
+         readPayload: @escaping (Entry, ProbeCancellation?) -> Data?,
+         refine: @escaping (Double, Int, ProbeCancellation) -> ScrubFrame?,
          buildFragment: @escaping (Data, Int, Entry) -> IFrameFragmentBuilder.Output?,
          waitForLink: @escaping (_ shouldStop: () -> Bool) -> Void = { _ in },
          sourceReadsAllowed: @escaping () -> Bool = { true },
@@ -69,6 +71,7 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
         self.entries = entries
         self.cache = cache
         self.readPayload = readPayload
+        self.refine = refine
         self.buildFragment = buildFragment
         self.waitForLink = waitForLink
         self.sourceReadsAllowed = sourceReadsAllowed
@@ -103,22 +106,24 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
     /// neighbour's in its place: a scrub preview names the span it shows, so a stand-in would put
     /// the wrong picture over the right time. `isStale` is asked before the source is touched, so a
     /// queue of superseded requests costs no reads.
-    func keyframePayload(at index: Int, isStale: () -> Bool = { false }) -> Data? {
+    func keyframePayload(at index: Int, cancellation: ProbeCancellation? = nil, isStale: () -> Bool = { false }) -> Data? {
         gate.withTurn(.request) {
             guard !shutDown, entries.indices.contains(index) else { return nil }
             if let cached = cache.payload(for: index) { return cached }
-            guard !isStale() else { return nil }
-            return readLocked(at: index)
+            return readLocked(at: index, cancellation: cancellation, whenAllowed: { !isStale() })
         }
     }
 
     /// Reads the keyframe for `index` ahead of AVKit's request. With `buildsFragment` it also builds
     /// the fragment, which for a JPEG rendition is the decode, tone map and encode a request would
     /// otherwise wait for. Never stands a neighbour in: a miss is nil, and the ladder counts it.
-    func prefetch(at index: Int, buildsFragment: Bool) -> Data? {
+    func prefetch(at index: Int, buildsFragment: Bool, cancellation: ProbeCancellation? = nil,
+                  whenAllowed: () -> Bool = { true }) -> Data? {
         gate.withTurn(.prefetch) {
             guard !shutDown, entries.indices.contains(index) else { return nil }
-            guard let payload = cache.payload(for: index) ?? readLocked(at: index) else { return nil }
+            guard cancellation?.isCancelled != true,
+                  let payload = cache.payload(for: index) ?? readLocked(at: index, cancellation: cancellation,
+                                                                       whenAllowed: whenAllowed) else { return nil }
             if buildsFragment, !shutDown { _ = buildLocked(at: index) }
             return payload
         }
@@ -130,16 +135,25 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
         return cache.payload(for: index)
     }
 
+    func refinedFrame(at seconds: Double, maxWidth: Int, cancellation: ProbeCancellation,
+                      whenAllowed: () -> Bool = { true }) -> ScrubFrame? {
+        gate.withTurn(.request) {
+            guard !shutDown, !cancellation.isCancelled, whenAllowed(), sourceReadsAllowed() else { return nil }
+            return refine(seconds, maxWidth, cancellation)
+        }
+    }
+
     /// Reads and caches one keyframe. nil when the origin has no room for it, teardown interrupted
     /// it, or the read failed.
-    private func readLocked(at index: Int) -> Data? {
+    private func readLocked(at index: Int, cancellation: ProbeCancellation? = nil,
+                            whenAllowed: () -> Bool = { true }) -> Data? {
         // An origin that went serial or started metering mid-session has one slot and a few
         // tokens, and the pump needs them; AVKit's overview burst would take them all.
-        guard sourceReadsAllowed() else { return nil }
-        waitForLink { self.shutDown }
-        guard !shutDown else { return nil }
+        guard whenAllowed(), sourceReadsAllowed() else { return nil }
+        waitForLink { self.shutDown || cancellation?.isCancelled == true }
+        guard !shutDown, cancellation?.isCancelled != true, whenAllowed(), sourceReadsAllowed() else { return nil }
         let started = DispatchTime.now()
-        let read = readPayload(entries[index])
+        let read = readPayload(entries[index], cancellation)
         // A read that teardown aborted is not a miss to paper over.
         guard !shutDown, let read else { return nil }
         let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000

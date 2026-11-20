@@ -12,6 +12,7 @@ extension AVIOReader {
         var totalRead = 0
 
         while totalRead < requestSize {
+            if isClosed { return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eio }
             streamLock.lock()
             let posInBuffer = Int(position - streamBytesRead)
             let available = streamBuffer.count - posInBuffer
@@ -218,7 +219,7 @@ extension AVIOReader {
         }
 
         let streamSession = URLSession(
-            configuration: Self.makeSessionConfig(longLived: true),
+            configuration: captureStreamConfiguration ?? Self.makeSessionConfig(longLived: true),
             delegate: delegate,
             delegateQueue: AVIOReader.makePlaybackDelegateQueue()
         )

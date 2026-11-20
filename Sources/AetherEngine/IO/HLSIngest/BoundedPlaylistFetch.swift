@@ -86,7 +86,21 @@ enum BoundedFetch {
     static func data(for request: URLRequest, session: URLSession, limit: Int, role: SourceNetworkDiagnostics.Role = .boundedBody) async throws
         -> (Data, URLResponse)
     {
-        let delegate = BoundedBodyDelegate(limit: limit, role: role, context: SourceNetworkDiagnostics.context(for: request))
+        try await transfer(request, session: session, limit: limit, role: role, file: nil)
+    }
+
+    /// SVPlayer modification. Stream a bitmap companion to a private file using the same byte
+    /// ceiling, cancellation, redirect and TLS checks as the in-memory subtitle fetch.
+    static func file(for request: URLRequest, session: URLSession, limit: Int, to url: URL) async throws -> URLResponse {
+        guard FileManager.default.createFile(atPath: url.path, contents: nil) else { throw CocoaError(.fileWriteUnknown) }
+        let file = try FileHandle(forWritingTo: url)
+        defer { try? file.close() }
+        return try await transfer(request, session: session, limit: limit, role: .boundedBody, file: file).1
+    }
+
+    private static func transfer(_ request: URLRequest, session: URLSession, limit: Int, role: SourceNetworkDiagnostics.Role,
+                                 file: FileHandle?) async throws -> (Data, URLResponse) {
+        let delegate = BoundedBodyDelegate(limit: limit, role: role, context: SourceNetworkDiagnostics.context(for: request), file: file)
         defer { withExtendedLifetime(delegate) {} }
         let task = session.dataTask(with: request)
         task.delegate = delegate
@@ -128,6 +142,9 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
     private let limit: Int
     private let trace: SourceNetworkDiagnostics.Trace
     private var buffer = Data()
+    private let file: FileHandle?
+    private var received = 0
+    private var writeError: Error?
     private var response: URLResponse?
     private var verdict: Verdict?
 
@@ -137,8 +154,9 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
     private var onOutcome: ((Outcome) -> Void)?
     private var landed: Outcome?
 
-    init(limit: Int, role: SourceNetworkDiagnostics.Role, context: SourceNetworkDiagnostics.Context?) {
+    init(limit: Int, role: SourceNetworkDiagnostics.Role, context: SourceNetworkDiagnostics.Context?, file: FileHandle? = nil) {
         self.limit = limit
+        self.file = file
         trace = .init(role: role, context: context)
         super.init()
     }
@@ -189,19 +207,28 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
             completionHandler(.cancel)
             return
         }
-        if declared > 0 { buffer.reserveCapacity(Int(min(declared, 8 * 1024 * 1024))) }
+        if file == nil, declared > 0 { buffer.reserveCapacity(Int(min(declared, 8 * 1024 * 1024))) }
         completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard verdict == nil else { return }
-        guard buffer.count + data.count <= limit else {
+        guard verdict == nil, writeError == nil else { return }
+        guard data.count <= limit - received else {
             verdict = .exceeded
             buffer = Data()
             dataTask.cancel()
             return
         }
-        buffer.append(data)
+        received += data.count
+        if let file {
+            do { try file.write(contentsOf: data) }
+            catch {
+                writeError = error
+                dataTask.cancel()
+            }
+        } else {
+            buffer.append(data)
+        }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -214,7 +241,7 @@ private final class BoundedBodyDelegate: EngineTLS.RedirectScrubbingDelegate, UR
         case .exceeded?:
             deliver(.exceeded)
         case nil:
-            if let error {
+            if let error = writeError ?? error {
                 deliver(.failed(error))
             } else if let response {
                 deliver(.body(buffer, response))

@@ -1502,6 +1502,52 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
+    // SVPlayer modification: a one-frame capture gets its first bytes and object length in
+    // one cancellable Range. It needs neither playback's tail warmup nor a separate HEAD.
+    // The caller supplies FFmpeg's AVIOContext and drives this reader directly.
+    private(set) var captureStreamConfiguration: URLSessionConfiguration?
+
+    func openCaptureRange(start: Int64 = 0, length: Int? = nil) throws -> (url: URL, prefix: Data) {
+        try probeControl?.check()
+        let count = min(chunkSize, length ?? chunkSize)
+        guard !isClosed, count > 0, start >= 0, start <= Int64.max - Int64(count) else {
+            throw ProbeError.invalidReaderResult
+        }
+        var request = URLRequest(engineURL: url)
+        request.setValue("bytes=\(start)-\(start + Int64(count) - 1)", forHTTPHeaderField: "Range")
+        applyExtraHeaders(&request)
+        let (bytes, response) = try syncRequest(request, budget: chunkRequestTimeout)
+        try probeControl?.check()
+        guard !isClosed, !bytes.isEmpty, let http = response as? HTTPURLResponse,
+              http.statusCode == 206 || http.statusCode == 200,
+              Self.misplacedRangeStart(http, requestedOffset: start) == nil else {
+            throw ProbeError.invalidReaderResult
+        }
+        let total = Self.sizeFromResponse(http, requestedOffset: http.statusCode == 200 ? 0 : start)
+        let fullBody = total.map { $0 == Int64(bytes.count) } ?? (bytes.count < count)
+        if http.statusCode == 200 && fullBody {
+            fileSize = Int64(bytes.count)
+            currentOffset = 0
+            currentBuffer = bytes
+            position = start
+            return (response.url ?? url, bytes)
+        }
+        if http.statusCode == 200 || (total == nil && bytes.count == count) {
+            // A server without random access can still serve progressive containers. Keep the
+            // original capture budget and configured URLSession on the bounded sequential GET.
+            captureStreamConfiguration = probeRequestSession?.configuration
+            originIgnoresRange = true
+            streamLock.withLock { streamExpectedBytes = total ?? -1 }
+            startStreamingDownload()
+            return (response.url ?? url, bytes)
+        }
+        fileSize = total ?? (start + Int64(bytes.count))
+        currentOffset = start
+        currentBuffer = bytes
+        position = start
+        return (response.url ?? url, bytes)
+    }
+
     func open() throws {
         try probeControl?.check()
         guard !isClosed else { throw CancellationError() }
@@ -5570,7 +5616,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // origin, which is the ordinary shape when a host probes several items off one server.
         let slotWait = probeControl.remainingTime.map { min(timeout, $0) } ?? timeout
         guard let ticket = OriginRequestBudget.shared.acquire(
-            for: url, label: label, timeout: slotWait) else {
+            for: url, label: label, timeout: slotWait,
+            shouldAbort: { [weak self] in self?.isClosed != false || (shouldAbort?() ?? false) }) else {
+            try probeControl.check()
             probeControl.stop(ProbeError.sourceBusy)
             throw ProbeError.sourceBusy
         }

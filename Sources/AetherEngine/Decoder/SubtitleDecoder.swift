@@ -74,12 +74,12 @@ enum SubtitleDecoder {
         sourceStreamIndex: Int32? = nil,
         preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
         keepsBitmapPackets: Bool = false,
-        formatHint: String? = nil
+        formatHint: String? = nil, sourceOrigin: Double = 0
     ) async throws -> SidecarDecodeResult {
         let results = try await decode(
             url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
             requested: sourceStreamIndex.map { [$0] }, preparationPolicy: preparationPolicy,
-            keepsBitmapPackets: keepsBitmapPackets, formatHint: formatHint
+            keepsBitmapPackets: keepsBitmapPackets, formatHint: formatHint, sourceOrigin: sourceOrigin
         )
         guard let only = results.first else { throw SubtitleDecoderError.noSubtitleStream }
         return only
@@ -95,12 +95,12 @@ enum SubtitleDecoder {
         httpHeaders: [String: String] = [:],
         preserveASSMarkup: Bool = false,
         sourceStreamIndices: [Int32?],
-        formatHint: String? = nil
+        formatHint: String? = nil, sourceOrigin: Double = 0
     ) async throws -> [SidecarDecodeResult] {
         guard !sourceStreamIndices.isEmpty else { return [] }
         return try await decode(
             url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
-            requested: sourceStreamIndices, formatHint: formatHint
+            requested: sourceStreamIndices, formatHint: formatHint, sourceOrigin: sourceOrigin
         )
     }
 
@@ -110,15 +110,21 @@ enum SubtitleDecoder {
         httpHeaders: [String: String],
         preserveASSMarkup: Bool,
         requested: [Int32?]?, preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
-        keepsBitmapPackets: Bool = false, formatHint: String? = nil
+        keepsBitmapPackets: Bool = false, formatHint: String? = nil, sourceOrigin: Double = 0
     ) async throws -> [SidecarDecodeResult] {
+        if preparationPolicy == nil, let pair = SidecarTextFetch.vobSubPair(url) {
+            let index = try await SidecarTextFetch.downloadVobSub(pair, headers: httpHeaders)
+            defer { try? FileManager.default.removeItem(at: index.deletingLastPathComponent()) }
+            return try await decode(url: index, httpHeaders: [:], preserveASSMarkup: preserveASSMarkup,
+                                    requested: requested, keepsBitmapPackets: keepsBitmapPackets, sourceOrigin: sourceOrigin)
+        }
         // AE#984: a text sidecar over HTTP is one whole-body GET, then a local decode.
         if preparationPolicy == nil, SidecarTextFetch.appliesTo(url, formatHint: formatHint) {
             let local = try await SidecarTextFetch.download(url, headers: httpHeaders, formatHint: formatHint)
             defer { try? FileManager.default.removeItem(at: local) }
             return try await decode(
                 url: local, httpHeaders: [:], preserveASSMarkup: preserveASSMarkup,
-                requested: requested, keepsBitmapPackets: keepsBitmapPackets)
+                requested: requested, keepsBitmapPackets: keepsBitmapPackets, sourceOrigin: sourceOrigin)
         }
         // Task.cancel() does NOT propagate into detached tasks (isCancelled inside always false).
         // Bridge cancellation explicitly via CancelFlag so the decode loop + AVIO reader abort promptly.
@@ -128,7 +134,7 @@ enum SubtitleDecoder {
                 try decodeFileSync(
                     url: url, httpHeaders: httpHeaders,
                     preserveASSMarkup: preserveASSMarkup, requested: requested, cancel: token, preparationPolicy: preparationPolicy,
-                    keepsBitmapPackets: keepsBitmapPackets
+                    keepsBitmapPackets: keepsBitmapPackets, sourceOrigin: sourceOrigin
                 )
             }.value
         } onCancel: {
@@ -416,7 +422,7 @@ enum SubtitleDecoder {
     private static func decodeFileSync(
         url: URL, httpHeaders: [String: String],
         preserveASSMarkup: Bool, requested: [Int32?]?, cancel: CancelFlag, preparationPolicy: ExternalSubtitlePreparationPolicy?,
-        keepsBitmapPackets: Bool = false
+        keepsBitmapPackets: Bool = false, sourceOrigin: Double = 0
     ) throws -> [SidecarDecodeResult] {
         if let preparationPolicy {
             #if DEBUG
@@ -468,6 +474,10 @@ enum SubtitleDecoder {
                 }
                 inputFormat = av_find_input_format(name)
                 guard inputFormat != nil else { throw SubtitleDecoderError.unsupportedTextCodec }
+                av_dict_set(&options, "protocol_whitelist", "file", 0)
+            } else if url.isFileURL, url.pathExtension.lowercased() == "idx" {
+                inputFormat = av_find_input_format("vobsub")
+                guard inputFormat != nil else { throw SubtitleDecoderError.noDecoder }
                 av_dict_set(&options, "protocol_whitelist", "file", 0)
             }
             let ret = avformat_open_input(&ctx, urlString, inputFormat, &options)
@@ -547,7 +557,15 @@ enum SubtitleDecoder {
             if decoder != nil || bitmapSource != nil,
                let stream = fmt.pointee.streams[Int(pkt.pointee.stream_index)] {
                 // Audit FEA-101 / SUB-105: this loop reads libavformat directly, past Demuxer's bound.
-                SourceTimestampBounds.sanitize(pkt, timeBase: stream.pointee.time_base)
+                // SVPlayer modification. A standalone file is timed from movie start. Rebase the
+                // packet before bitmap indexing so seeks, rendered cues and PiP share source PTS.
+                let timeBase = stream.pointee.time_base
+                if sourceOrigin != 0, timeBase.num > 0, timeBase.den > 0, pkt.pointee.pts != Int64.min,
+                   let ticks = Int64(exactly: (sourceOrigin * Double(timeBase.den) / Double(timeBase.num)).rounded()) {
+                    let (shifted, overflow) = pkt.pointee.pts.addingReportingOverflow(ticks)
+                    pkt.pointee.pts = overflow ? Int64.min : shifted
+                }
+                SourceTimestampBounds.sanitize(pkt, timeBase: timeBase)
                 decoder?.decode(packet: pkt)
                 bitmapSource?.harvest(packet: pkt, timeBase: stream.pointee.time_base)
             }

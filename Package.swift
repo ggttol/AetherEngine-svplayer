@@ -141,6 +141,18 @@ let package = Package(
             dependencies: ["AetherEngine"],
             path: "Tests/AetherEngineTests"
         ),
+        // SVPlayer modification (2026-11-20): audio packet tap regression tests.
+        .testTarget(
+            name: "AetherEnginePacketTapTests",
+            dependencies: ["AetherEngine", .product(name: "AetherFFmpegBuild", package: "FFmpegBuild")],
+            path: "Tests/AetherEnginePacketTapTests"
+        ),
+        // SVPlayer modification (2026-11-20): audio packet tap regression tests.
+        .testTarget(
+            name: "AetherEnginePacketTapTests",
+            dependencies: ["AetherEngine", .product(name: "AetherFFmpegBuild", package: "FFmpegBuild")],
+            path: "Tests/AetherEnginePacketTapTests"
+        ),
         .testTarget(
             name: "AetherEngineSMBTests",
             dependencies: ["AetherEngineSMB"],

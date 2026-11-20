@@ -74,14 +74,54 @@ extension AetherEngine {
         return released
     }
 
-    /// Timestamped production preview. All reads come from existing resident
-    /// bytes; a missing target never opens a second connection or seeks playback.
+    /// SVPlayer modification: synchronous lookup of the nearest decoded picture on the
+    /// display timeline. The rung is stamped on the playlist axis by the ladder worker.
+    public func readyScrubPreviewFrame(atSeconds seconds: Double) -> ScrubFrame? {
+        guard seconds.isFinite, !isLive, supportsCacheBackedStills else { return nil }
+        let recent = recentScrubFrames.nearest(to: seconds).flatMap {
+            abs($0.actualSeconds - seconds) <= KeyframeStillLadder.maximumAnswerDistanceSeconds ? $0 : nil
+        }
+        guard let session = nativeVideoSession else { return recent }
+        let shift = session.firstKeyframeSeconds - sourcePresentationOrigin
+        guard let rung = session.readyLadderFrame(at: seconds - shift)?.shifted(by: shift),
+              abs(rung.actualSeconds - seconds) <= KeyframeStillLadder.maximumAnswerDistanceSeconds else { return recent }
+        guard let recent else { return rung }
+        return abs(recent.actualSeconds - seconds) <= abs(rung.actualSeconds - seconds) ? recent : rung
+    }
+
+    public func updateScrubPreviewTarget(atSeconds seconds: Double?) {
+        guard !isLive, let session = nativeVideoSession, session.yieldsStills else { return }
+        let shift = session.firstKeyframeSeconds - sourcePresentationOrigin
+        session.updateScrubFinger(seconds.map { $0 - shift }, playhead: nativeHost?.renderedTime)
+    }
+
+    /// Existing clients only decode resident data. An interactive refinement may opt into a
+    /// separately budgeted, cancellable read of an ordinary seekable VOD when its link is idle.
     public func scrubPreviewFrame(atSeconds seconds: Double, refined: Bool, maxWidth: Int = 320,
+                                  sourceRefinement: ProbeCancellation? = nil,
                                   isCancelled: @escaping @Sendable () -> Bool) async -> ScrubFrame? {
+        let generation = loadGeneration
+        let allowsRead = refined && sourceRefinement != nil
+        if allowsRead, !isLive, maxWidth == 320, let precise = recentScrubFrames.nearest(to: seconds),
+           precise.isRefined(at: seconds), !Task.isCancelled, !isCancelled() { return precise }
+        var frame = await cacheBackedScrubPreviewFrame(atSeconds: seconds, refined: refined, maxWidth: maxWidth,
+                                                       includesLadder: !allowsRead, isCancelled: isCancelled)
+        guard generation == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+        if allowsRead, let cancellation = sourceRefinement, frame?.isRefined(at: seconds) != true {
+            frame = await sourceScrubRefinement(atSeconds: seconds, maxWidth: maxWidth, cancellation: cancellation)
+        }
+        guard generation == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+        if let frame, !isLive, maxWidth <= 320 { recentScrubFrames.insert(frame) }
+        return frame
+    }
+
+    private func cacheBackedScrubPreviewFrame(atSeconds seconds: Double, refined: Bool, maxWidth: Int,
+                                              includesLadder: Bool,
+                                              isCancelled: @escaping @Sendable () -> Bool) async -> ScrubFrame? {
         guard seconds.isFinite, !Task.isCancelled, !isCancelled() else { return nil }
         let gen = loadGeneration
         guard let session = nativeVideoSession else {
-            guard let host = softwareHost else { return nil }
+            guard let host = softwareHost, host.videoYieldsStills else { return nil }
             if softwareStillsFromLocalFile {
                 let result = await localSoftwareStill(atSessionSeconds: seconds, refined: refined,
                                                       maxWidth: maxWidth, isCancelled: isCancelled)
@@ -100,17 +140,17 @@ extension AetherEngine {
         // here so the request and its result convert on one axis even if the shift moves meanwhile.
         let liveShift = liveSessionShiftSeconds
         let sourceTarget = PresentationAxis.source(displayTime: seconds, origin: origin)
-        let output = live ? seconds - liveShift
-            : sourceTarget - session.firstKeyframeSeconds
         let planOrigin = session.firstKeyframeSeconds - origin
+        let output = live ? seconds - liveShift : seconds - planOrigin
         let source = await BlockingWork.detached(priority: .utility) { [session] in
             session.scrubThumbnailSource(atSeconds: output)
         }.value
         guard gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
         guard let source else {
-            guard !live else { return nil }
+            guard !live, includesLadder else { return nil }
             return await ladderPreviewFrame(session: session, outputSeconds: output, planOrigin: planOrigin,
-                                            maxWidth: maxWidth, generation: gen, isCancelled: isCancelled)
+                                            maxWidth: maxWidth, generation: gen, prioritizeFinger: !refined,
+                                            isCancelled: isCancelled)
         }
         guard let carried = source.carriedOffset else { return nil }
         guard let extractor = scrubExtractor(key: source.segmentIndex, identity: source.identity, make: {
@@ -137,16 +177,52 @@ extension AetherEngine {
                          validRange: rangeStart..<(rangeStart + source.durationSeconds))
     }
 
-    /// The answer for a VOD position nothing resident covers: the nearest keyframe the still ladder
-    /// read while the link was idle (`KeyframeStillLadder`). Its `actualSeconds` and `validRange` name
-    /// the rung's own segment, so a host can tell it from a frame at the target. Never reads the source.
+    /// SVPlayer modification: a native VOD reuses the foreground rung's serial AVIO reader.
+    /// Remote software playback uses its resident packet cache. Local files can seek directly.
+    private func sourceScrubRefinement(atSeconds seconds: Double, maxWidth: Int,
+                                       cancellation: ProbeCancellation) async -> ScrubFrame? {
+        guard seconds.isFinite, seconds >= 0, maxWidth > 0, maxWidth <= 320,
+              !isLive, supportsCacheBackedStills, !scrubPreviewDrawsInView,
+              !isSeeking, !isBuffering, !loadedOptions.sequentialOrigin, !loadedOptions.heldSourceConnection,
+              isSourceSeekable == true, activeDiscTitleID == nil, !isCustomSource,
+              let url = loadedURL, !Task.isCancelled, !cancellation.isCancelled else { return nil }
+        if let session = nativeVideoSession {
+            let shift = session.firstKeyframeSeconds - sourcePresentationOrigin
+            let still = await BlockingWork.detached(priority: .utility) {
+                session.refineScrubFinger(at: seconds - shift, maxWidth: maxWidth, cancellation: cancellation)
+            }.value
+            return still?.shifted(by: shift)
+        }
+        guard url.isFileURL, let host = softwareHost, let extractor = makeFrameExtractor() else { return nil }
+        let origin = host.sourceSeconds(forSession: 0)
+        let limit = ProbeLimits(maxInputBytes: 8 * 1024 * 1024, maxPackets: 900,
+                                maxPacketBytes: 4 * 1024 * 1024, timeBudget: 2)
+        let size = CGSize(width: CGFloat(maxWidth), height: CGFloat(maxWidth))
+        let still = await extractor.boundedSnapshot(at: seconds + origin, maxSize: size,
+                                                    limits: limit, cancellation: cancellation)
+        await extractor.shutdown()
+        guard let still, let actual = still.actualSeconds, actual.isFinite,
+              abs(actual - origin - seconds) < 2 else { return nil }
+        return ScrubFrame(image: still.image, actualSeconds: actual - origin, refined: true, source: .sourceRead)
+    }
+
+    /// The selected segment's own coarse image takes priority. Other callers only consult cached rungs.
     private func ladderPreviewFrame(session: HLSVideoEngine, outputSeconds: Double, planOrigin: Double,
-                                    maxWidth: Int, generation gen: UInt64,
+                                    maxWidth: Int, generation gen: UInt64, prioritizeFinger: Bool,
                                     isCancelled: @escaping @Sendable () -> Bool) async -> ScrubFrame? {
-        let rung = await BlockingWork.detached(priority: .utility) { [session] in
-            session.stillLadderFrame(atSeconds: outputSeconds)
+        let answer = await BlockingWork.detached(priority: .utility) { [session] () -> HLSVideoEngine.LadderPreview? in
+            if prioritizeFinger, maxWidth == 320,
+               let frame = session.fingerLadderFrame(at: outputSeconds, isCancelled: isCancelled) {
+                return HLSVideoEngine.LadderPreview.ready(frame)
+            }
+            return session.stillLadderFrame(atSeconds: outputSeconds, maxWidth: maxWidth)
         }.value
-        guard let rung, gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+        guard let answer, gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+        let rung: HLSVideoEngine.StillLadderFrame
+        switch answer {
+        case .ready(let frame): return frame.shifted(by: planOrigin)
+        case .compressed(let payload): rung = payload
+        }
         guard let extractor = scrubExtractor(key: Self.ladderStillKey(segmentIndex: rung.segmentIndex), make: {
             FrameExtractor(residentReader: rung.makeReader(), formatHint: "mp4",
                            identity: "ladder:\(rung.segmentIndex)")
@@ -158,7 +234,7 @@ extension AetherEngine {
             }) else { return nil }
         let start = rung.startSeconds + planOrigin
         return ScrubFrame(image: frame.image, actualSeconds: start, refined: false,
-                          validRange: start..<(start + rung.durationSeconds))
+                          validRange: start..<(start + rung.durationSeconds), source: .ladder)
     }
 
     /// Ladder stills share the extractor LRU with resident segments under keys no segment carries
@@ -310,10 +386,10 @@ extension AetherEngine {
                 await extractor.boundedLocalStill(at: source, refined: refined, maxWidth: maxWidth,
                                                   isCancelled: isCancelled)
             }) else { return nil }
-        // The time of the frame that was decoded, back on the session axis. A source that stamps no
-        // frame time can only be labelled with the request.
+        // Only a measured timestamp can label a preview on the session axis.
         let zero = host.sourceSeconds(forSession: 0)
-        let actual = still.decodedSeconds.map { max(0, $0 - zero) } ?? seconds
+        guard let measured = still.decodedSeconds, measured.isFinite else { return nil }
+        let actual = max(0, measured - zero)
         return ScrubFrame(image: still.image, actualSeconds: actual, refined: refined)
     }
 
@@ -330,7 +406,7 @@ extension AetherEngine {
     /// trait, where no frame can become a correct still; `scrubPreviewDrawsInView` covers that source.
     public var supportsCacheBackedStills: Bool {
         if let session = nativeVideoSession { return session.yieldsStills }
-        guard let softwareHost else { return false }
+        guard let softwareHost, softwareHost.videoYieldsStills else { return false }
         return isLive || softwareHost.servesPacketCacheStills || softwareStillsFromLocalFile
     }
 }

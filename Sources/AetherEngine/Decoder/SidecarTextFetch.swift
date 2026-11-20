@@ -49,6 +49,52 @@ enum SidecarTextFetch {
     static let session = URLSession(
         configuration: sessionConfiguration(), delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
 
+    /// SVPlayer modification. VobSub opens its SUB next to its IDX using a file name derived by
+    /// libavformat. Keep both requests on the registered origin, preserving the encoded path and query.
+    static func vobSubPair(_ url: URL) -> (index: URL, payload: URL)? {
+        guard var parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = parts.scheme?.lowercased(), ["http", "https"].contains(scheme) else { return nil }
+        let path = parts.percentEncodedPath
+        guard path.lowercased().hasSuffix(".idx") || path.lowercased().hasSuffix(".sub") else { return nil }
+        let upper = path.suffix(3) == path.suffix(3).uppercased()
+        parts.percentEncodedPath = path.dropLast(3) + (upper ? "IDX" : "idx")
+        guard let index = parts.url else { return nil }
+        parts.percentEncodedPath = path.dropLast(3) + (upper ? "SUB" : "sub")
+        guard let payload = parts.url else { return nil }
+        return (index, payload)
+    }
+
+    static func downloadVobSub(_ pair: (index: URL, payload: URL), headers: [String: String],
+                               session: URLSession = session) async throws -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aether-vobsub-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let index = directory.appendingPathComponent("captions.idx")
+        do {
+            for (remote, local, limit) in [(pair.index, index, 8 * 1024 * 1024),
+                                           (pair.payload, directory.appendingPathComponent("captions.sub"), SidecarBitmapSource.byteCap)] {
+                try Task.checkCancellation()
+                var request = URLRequest(engineURL: remote)
+                for (field, value) in headers { request.setValue(value, forHTTPHeaderField: field) }
+                let response = try await BoundedFetch.file(for: request, session: session, limit: limit, to: local)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                guard (200..<300).contains(status) else { throw SubtitleDecoderError.httpStatus(status) }
+                if local == index {
+                    let handle = try FileHandle(forReadingFrom: index)
+                    defer { try? handle.close() }
+                    let prefix = try handle.read(upToCount: 96) ?? Data()
+                    guard String(decoding: prefix, as: UTF8.self).contains("VobSub index file") else {
+                        throw SubtitleDecoderError.noSubtitleStream
+                    }
+                }
+            }
+            try Task.checkCancellation()
+            return index
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+
     /// The whole body, written to a temporary file named with the sidecar's own extension so
     /// libavformat probes it exactly as it probed the URL. The caller removes the file.
     static func download(_ url: URL, headers: [String: String], formatHint: String?,

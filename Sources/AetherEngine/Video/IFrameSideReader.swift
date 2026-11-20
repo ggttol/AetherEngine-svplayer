@@ -1,5 +1,6 @@
 // Sources/AetherEngine/Video/IFrameSideReader.swift
 import Foundation
+import CoreGraphics
 import AetherLibavcodec
 
 /// AE#682: reads the keyframe that opens a plan segment, on a demuxer of its own. Only the bytes
@@ -87,7 +88,7 @@ final class IFrameSideReader: @unchecked Sendable {
                        + "\(Int(coolDown))s (consecutive failures: \(failures))", category: .session)
     }
 
-    private func readyDemuxer() -> Demuxer? {
+    private func readyDemuxer(cancellation: ProbeCancellation) -> Demuxer? {
         lock.lock()
         if interrupted { lock.unlock(); return nil }
         if let demuxer, isOpen { lock.unlock(); return demuxer }
@@ -97,21 +98,24 @@ final class IFrameSideReader: @unchecked Sendable {
 
         let started = DispatchTime.now()
         do {
-            try open(dem)
+            try cancellation.withInterruption({ dem.markClosed() }) {
+                guard !cancellation.isCancelled else { throw CancellationError() }
+                try open(dem)
+            }
         } catch {
             drop(dem)
-            noteFailure("open failed: \(error)")
+            if !cancellation.isCancelled { noteFailure("open failed: \(error)") }
             return nil
         }
         let index = dem.videoStreamIndex
-        guard index >= 0 else {
+        guard index >= 0, !cancellation.isCancelled else {
             drop(dem)
-            noteFailure("open failed: no video stream")
+            if !cancellation.isCancelled { noteFailure("open failed: no video stream") }
             return nil
         }
         dem.discardAllStreamsExcept([index])
         lock.lock()
-        if interrupted {
+        if interrupted || cancellation.isCancelled {
             lock.unlock()
             drop(dem)
             return nil
@@ -127,13 +131,15 @@ final class IFrameSideReader: @unchecked Sendable {
         return dem
     }
 
-    func payload(startPts: Int64) -> Data? {
+    func payload(startPts: Int64, cancellation: ProbeCancellation? = nil) -> Data? {
+        let token = cancellation ?? ProbeCancellation()
         lock.lock()
         let held = interrupted || now() < blockedUntil
         lock.unlock()
-        if held { return nil }
-        guard let dem = readyDemuxer() else { return nil }
-        if let data = read(dem, startPts: startPts) {
+        guard !held, !token.isCancelled, let dem = readyDemuxer(cancellation: token) else { return nil }
+        let bytes = token.withInterruption({ dem.markClosed() }) { read(dem, startPts: startPts) }
+        if token.isCancelled { drop(dem); return nil }
+        if let data = bytes {
             lock.lock(); consecutiveFailures = 0; lock.unlock()
             return data
         }
@@ -142,6 +148,35 @@ final class IFrameSideReader: @unchecked Sendable {
         drop(dem)
         noteFailure("read failed at pts=\(startPts)")
         return nil
+    }
+
+    func refinedFrame(at seconds: Double, maxWidth: Int, cancellation: ProbeCancellation) -> ScrubFrame? {
+        guard seconds.isFinite, maxWidth > 0, !cancellation.isCancelled,
+              lock.withLock({ !interrupted && now() >= blockedUntil }),
+              let control = try? ProbeControl(limits: .init(maxInputBytes: 8 * 1024 * 1024, maxPackets: 900,
+                                                           maxPacketBytes: 4 * 1024 * 1024, timeBudget: 2),
+                                              cancellation: cancellation) else { return nil }
+        let token = ProbeCancellation()
+        control.interrupt { token.cancel() }
+        defer { control.finish() }
+        guard let dem = readyDemuxer(cancellation: token) else { return nil }
+        defer { if token.isCancelled { drop(dem) } }
+        return token.withInterruption({ dem.markClosed() }) {
+            guard !token.isCancelled else { return nil }
+            dem.probeControl = control
+            dem.beginInputByteBudget(8 * 1024 * 1024)
+            defer { dem.endInputByteBudget(); dem.probeControl = nil }
+            guard let decoder = try? FrameDecodeContext(borrowing: dem) else { return nil }
+            defer { decoder.close() }
+            var actual: Double?
+            let size = CGSize(width: maxWidth, height: maxWidth)
+            let image = decoder.decodeFrame(at: seconds, mode: .snapshot, targetWidth: maxWidth, maxSize: size,
+                                            isCancelled: { token.isCancelled || control.isStopped },
+                                            residentDeadline: .now + .seconds(2), reportDecodedTime: { actual = $0 },
+                                            bounded: true)
+            guard let image, let actual, abs(actual - seconds) < 2, (try? control.complete()) != nil else { return nil }
+            return ScrubFrame(image: image, actualSeconds: actual, refined: true, source: .sourceRead)
+        }
     }
 
     private func read(_ dem: Demuxer, startPts: Int64) -> Data? {

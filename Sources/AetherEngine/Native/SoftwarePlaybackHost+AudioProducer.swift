@@ -243,7 +243,7 @@ extension SoftwarePlaybackHost {
             EngineLog.emit("[SWHost] audio: \(source.name) rendered into \(layout.rawValue) as "
                            + "\(format == .lpcm ? "PCM" : "APAC") for the renderer",
                            category: .swPlayback)
-            return SoftwareAPACProducer(bridge: bridge, stream: stream)
+            return SoftwareAPACProducer(bridge: bridge)
         } catch {
             EngineLog.emit("[SWHost] audio: \(source.name) APAC route unavailable (\(error)); PCM decode",
                            category: .swPlayback)

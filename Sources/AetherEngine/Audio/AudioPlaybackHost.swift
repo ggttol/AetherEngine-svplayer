@@ -12,6 +12,11 @@ import AetherLibavutil
 /// pattern), then `currentTime` is polled at 4 Hz off the synchronizer.
 @MainActor
 final class AudioPlaybackHost {
+    // SVPlayer modification. Audio-only media shares the same source-time packet tap as video.
+    let speechPackets = AudioPacketWindow()
+    func sourceSeconds(forSession seconds: Double) -> Double {
+        SWClockAnchorPolicy.sourceSeconds(forSession: seconds, sessionZeroSeconds: sessionZeroSeconds)
+    }
 
     // MARK: - Published state (mirrors SoftwarePlaybackHost surface)
 
@@ -182,6 +187,7 @@ final class AudioPlaybackHost {
         try aDec.open(stream: aStream)
         self.audioDecoder = aDec
         self.audioStreamIndex = resolvedAudioIdx
+        speechPackets.configure(stream: aStream, epoch: 0)
         self.audioOutput = AudioOutput()
         self.audioOutput?.volume = volume
 
@@ -404,6 +410,7 @@ final class AudioPlaybackHost {
         let aDec = audioDecoder
         let aOut = audioOutput
         let aIdx = audioStreamIndex
+        let speechHistory = speechPackets
         let condition = demuxCondition
         let initialClock = initialClockTime
         let initialRate = lastRate
@@ -433,6 +440,7 @@ final class AudioPlaybackHost {
                 audioDecoder: aDec,
                 audioOutput: aOut,
                 audioStreamIndex: aIdx,
+                speechPackets: speechHistory,
                 condition: condition,
                 initialClockTime: initialClock,
                 initialRate: initialRate,
@@ -455,6 +463,7 @@ final class AudioPlaybackHost {
         audioDecoder: AudioDecoder?,
         audioOutput: AudioOutput?,
         audioStreamIndex: Int32,
+        speechPackets: AudioPacketWindow,
         condition: NSCondition,
         initialClockTime: CMTime,
         initialRate: Float,
@@ -530,6 +539,7 @@ final class AudioPlaybackHost {
             }
 
             guard let packet else {
+                if seekGeneration() == seenSeekGeneration { speechPackets.finish() }
                 // Drain decoder-delay frames + the sub-threshold tail and enqueue them before flush()
                 // discards pending; extend the high-water mark so the playthrough wait below covers the
                 // tail. flush() alone dropped the final ~21ms+ of every audio-only title.
@@ -584,6 +594,7 @@ final class AudioPlaybackHost {
 
             if packet.pointee.stream_index == audioStreamIndex,
                let aDec = audioDecoder, let aOut = audioOutput {
+                speechPackets.append(packet)
                 let buffers = aDec.decode(packet: packet)
                 // Audit DEC-2 (the AE#491 rule on the audio-only host): the seek's flush can land
                 // inside `decode`, so the buffers are checked out again.

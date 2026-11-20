@@ -5,17 +5,17 @@ import AetherLibavcodec
 import AetherLibavutil
 import AetherLibswresample
 
-/// One decoded PCM chunk in the tap's fixed format. `ptsSeconds` is on the axis of the packets
-/// that were fed in (playlist axis when fed from loopback segments, source axis on the SW path).
+/// One decoded PCM chunk in the tap's fixed format on the engine's source PTS axis.
 struct AudioTapChunk {
     let buffer: AVAudioPCMBuffer
     let ptsSeconds: Double
     var channels: AudioTapChannels = .downmix
+    var discontinuity = false
 }
 
-/// FFmpeg decoder for the audio tap (#95): compressed packets to mono Float32 48 kHz
+/// FFmpeg decoder for the audio tap (#95): compressed packets to mono Float32 16 kHz
 /// `AVAudioPCMBuffer`s. Mirrors `AudioDecoder`'s lazy-resampler + lock discipline but with a
-/// fixed swr output and a running sample clock (anchor + emitted/48000) so chunks abut exactly.
+/// fixed swr output and a running sample clock (anchor + emitted/16000) so chunks abut exactly.
 final class AudioTapDecoder: @unchecked Sendable {
 
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
@@ -30,9 +30,10 @@ final class AudioTapDecoder: @unchecked Sendable {
 
     private var pending: [Float] = []
     private var pendingStartPTS: Double = 0
+    private var needsDiscontinuity = false
 
     /// What the current `swrContext` reads (#452). The tap outlives a live splice the same way the
-    /// SW path does, and its output side is pinned to mono 48 kHz, so only the input can move.
+    /// SW path does, and its output side is pinned to mono 16 kHz, so only the input can move.
     private var configuredInput = ResamplerInputParameters()
 
     /// What the host asked for, and what the current `swrContext` delivers: `.dialogue` falls
@@ -61,12 +62,18 @@ final class AudioTapDecoder: @unchecked Sendable {
 
     func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else { throw TapDecoderError.noCodecParameters }
-        timeBase = stream.pointee.time_base
+        try open(parameters: codecpar, timeBase: stream.pointee.time_base)
+    }
+
+    // SVPlayer modification: the packet tap owns a copy of the demux track description.
+    func open(parameters codecpar: UnsafePointer<AVCodecParameters>, timeBase: AVRational) throws {
+        self.timeBase = timeBase
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
             throw TapDecoderError.unsupportedCodec
         }
         guard let ctx = avcodec_alloc_context3(codec) else { throw TapDecoderError.allocFailed }
         codecContext = ctx
+        ctx.pointee.pkt_timebase = timeBase
         guard avcodec_parameters_to_context(ctx, codecpar) >= 0,
               avcodec_open2(ctx, codec, nil) >= 0 else {
             avcodec_free_context(&codecContext)
@@ -78,8 +85,22 @@ final class AudioTapDecoder: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard let ctx = codecContext else { return [] }
-        guard avcodec_send_packet(ctx, packet) >= 0 else { return [] }
-        return receiveAll(ctx)
+        var chunks: [AudioTapChunk] = []
+        if (packet.pointee.flags & AV_PKT_FLAG_CORRUPT) != 0 {
+            recover(ctx, code: FFmpegErr.invalidData, into: &chunks)
+            return chunks
+        }
+        var sent = avcodec_send_packet(ctx, packet)
+        if sent == FFmpegErr.eagain {
+            chunks = receiveAll(ctx)
+            sent = avcodec_send_packet(ctx, packet)
+        }
+        guard sent >= 0 else {
+            recover(ctx, code: sent, into: &chunks)
+            return chunks
+        }
+        chunks += receiveAll(ctx)
+        return chunks
     }
 
     /// EOF drain: flush delay frames, then force-emit the sub-threshold tail.
@@ -102,19 +123,42 @@ final class AudioTapDecoder: @unchecked Sendable {
         pending.removeAll()
         anchorPTS = nil
         samplesSinceAnchor = 0
+        needsDiscontinuity = false
     }
 
     deinit { close() }
 
     // MARK: - Internals (all called with stateLock held)
 
+    /// SVPlayer modification. Preserve good output before the hole and re-anchor on the next decoded PTS.
+    private func recover(_ context: UnsafeMutablePointer<AVCodecContext>, code: Int32, into chunks: inout [AudioTapChunk]) {
+        if let tail = emitPending(force: true) { chunks.append(tail) }
+        if !needsDiscontinuity { EngineLog.emit("[AudioTap] recovering decode error code=\(code)", category: .engine) }
+        avcodec_flush_buffers(context)
+        if swrContext != nil { swr_free(&swrContext) }
+        configuredInput.release()
+        anchorPTS = nil
+        samplesSinceAnchor = 0
+        needsDiscontinuity = true
+    }
+
     private func receiveAll(_ ctx: UnsafeMutablePointer<AVCodecContext>) -> [AudioTapChunk] {
         var chunks: [AudioTapChunk] = []
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         defer { av_frame_free(&frame) }
         guard let f = frame else { return [] }
-        while avcodec_receive_frame(ctx, f) >= 0 {
-            if swrContext == nil, !initResampler(from: f) { continue }
+        while true {
+            let result = avcodec_receive_frame(ctx, f)
+            guard result >= 0 else {
+                if result != FFmpegErr.eagain, result != FFmpegErr.eof {
+                    recover(ctx, code: result, into: &chunks)
+                }
+                break
+            }
+            if f.pointee.flags & AV_FRAME_FLAG_CORRUPT != 0 || (swrContext == nil && !initResampler(from: f)) {
+                recover(ctx, code: FFmpegErr.invalidData, into: &chunks)
+                break
+            }
             // A mid-stream input change (5.1 to stereo at a live program boundary) leaves the context
             // reading planes the frame no longer carries, which faults inside swr_convert (#452).
             // The accumulator is already in the fixed output format and the running clock counts
@@ -129,9 +173,15 @@ final class AudioTapDecoder: @unchecked Sendable {
                     category: .engine)
                 if let tail = emitPending(force: true) { chunks.append(tail) }
                 swr_free(&swrContext)
-                if !initResampler(from: f) { continue }
+                guard initResampler(from: f) else {
+                    recover(ctx, code: FFmpegErr.invalidData, into: &chunks)
+                    break
+                }
             }
-            ingest(frame: f)
+            guard ingest(frame: f) else {
+                recover(ctx, code: FFmpegErr.invalidData, into: &chunks)
+                break
+            }
             if pending.count >= AudioTapDefaults.minSamplesPerChunk,
                let chunk = emitPending(force: false) {
                 chunks.append(chunk)
@@ -191,18 +241,21 @@ final class AudioTapDecoder: @unchecked Sendable {
         frontCentreIndex(of: layout)
     }
 
-    private func ingest(frame f: UnsafeMutablePointer<AVFrame>) {
-        guard let swr = swrContext, f.pointee.nb_samples > 0 else { return }
+    private func ingest(frame f: UnsafeMutablePointer<AVFrame>) -> Bool {
+        guard let swr = swrContext, f.pointee.nb_samples > 0 else { return false }
         // Corrupt live MPEG-TS decodes to a frame with samples but a NULL plane and declares no
         // change; swr_convert dereferences it (#452).
-        guard configuredInput.framePlanesArePresent(f) else { return }
+        guard configuredInput.framePlanesArePresent(f) else { return false }
 
         let framePTS: Double? = f.pointee.pts != Int64.min && timeBase.den > 0
             ? Double(f.pointee.pts) * Double(timeBase.num) / Double(timeBase.den)
             : nil
         let runningPTS = anchorPTS.map { $0 + Double(samplesSinceAnchor) / AudioTapDefaults.sampleRate }
+        // SVPlayer modification: await a real source timestamp when opening a new seek generation.
+        guard anchorPTS != nil || framePTS != nil else { return true }
         if anchorPTS == nil || (framePTS != nil && runningPTS != nil && abs(framePTS! - runningPTS!) > 0.25) {
             // First frame, or a real discontinuity: drop the misplaced tail and re-anchor.
+            if anchorPTS != nil { needsDiscontinuity = true }
             pending.removeAll(keepingCapacity: true)
             anchorPTS = framePTS ?? 0
             samplesSinceAnchor = 0
@@ -212,7 +265,7 @@ final class AudioTapDecoder: @unchecked Sendable {
         }
 
         let maxOut = Int(swr_get_out_samples(swr, f.pointee.nb_samples))
-        guard maxOut > 0 else { return }
+        guard maxOut > 0 else { return maxOut == 0 }
         var out = [Float](repeating: 0, count: maxOut)
         let converted: Int32 = out.withUnsafeMutableBytes { raw in
             var outPtr: UnsafeMutablePointer<UInt8>? =
@@ -224,9 +277,10 @@ final class AudioTapDecoder: @unchecked Sendable {
                 return swr_convert(swr, outBuf, Int32(maxOut), srcData, f.pointee.nb_samples)
             }
         }
-        guard converted > 0 else { return }
+        guard converted > 0 else { return converted == 0 }
         pending.append(contentsOf: out.prefix(Int(converted)))
         samplesSinceAnchor += Int64(converted)
+        return true
     }
 
     private func emitPending(force: Bool) -> AudioTapChunk? {
@@ -242,64 +296,12 @@ final class AudioTapDecoder: @unchecked Sendable {
         pending.withUnsafeBufferPointer { src in
             buf.floatChannelData![0].update(from: src.baseAddress!, count: src.count)
         }
-        let chunk = AudioTapChunk(buffer: buf, ptsSeconds: pendingStartPTS, channels: deliveredChannels)
+        let chunk = AudioTapChunk(buffer: buf, ptsSeconds: pendingStartPTS, channels: deliveredChannels,
+                                  discontinuity: needsDiscontinuity)
+        needsDiscontinuity = false
         pendingStartPTS += Double(pending.count) / AudioTapDefaults.sampleRate
         pending.removeAll(keepingCapacity: true)
         return chunk
     }
 }
 
-/// Decodes one loopback fMP4 fragment (#95): reads init + segment in place (the
-/// scrub-thumbnail precedent, see `DataIOReader`), demuxes, decodes the single audio track.
-/// A fresh demux + codec context per segment keeps it robust across producer restarts and
-/// track switches; the cost is negligible against 4-6 s of audio per segment.
-final class AudioTapSegmentDecoder: @unchecked Sendable {
-    private let channels: AudioTapChannels
-
-    init(channels: AudioTapChannels = .downmix) {
-        self.channels = channels
-    }
-
-    func decode(initData: Data, segment: Data) -> [AudioTapChunk] {
-        decode(reader: DataIOReader(parts: [initData, segment]))
-    }
-
-    /// Decode a self-describing HLS segment (MPEG-TS or fMP4-with-inline-moof) whose container
-    /// FFmpeg detects unaided. Used by the remote-HLS tap, where segments carry no separate init
-    /// blob (unlike the loopback fMP4 fragments). Same fresh-demux-per-segment discipline.
-    func decode(selfContainedSegment segment: Data) -> [AudioTapChunk] {
-        decode(reader: DataIOReader(data: segment))
-    }
-
-    private func decode(reader: DataIOReader) -> [AudioTapChunk] {
-        let demuxer = Demuxer()
-        do {
-            try demuxer.open(reader: reader)
-        } catch {
-            return []
-        }
-        defer { demuxer.close() }
-        let audioIdx = demuxer.audioStreamIndex
-        guard audioIdx >= 0, let stream = demuxer.stream(at: audioIdx) else { return [] }
-        // #910: the video packets of a loopback fragment are most of its bytes, and the tap never
-        // looks at them. Discarded here, the demuxer skips them instead of allocating each one.
-        demuxer.discardAllStreamsExcept([audioIdx])
-        let decoder = AudioTapDecoder(channels: channels)
-        do {
-            try decoder.open(stream: stream)
-        } catch {
-            return []
-        }
-        defer { decoder.close() }
-
-        var chunks: [AudioTapChunk] = []
-        while let packet = (try? demuxer.readPacket()) ?? nil {
-            var p: UnsafeMutablePointer<AVPacket>? = packet
-            defer { trackedPacketFree(&p) }
-            guard packet.pointee.stream_index == audioIdx else { continue }
-            chunks.append(contentsOf: decoder.decode(packet: packet))
-        }
-        chunks.append(contentsOf: decoder.drain())
-        return chunks
-    }
-}

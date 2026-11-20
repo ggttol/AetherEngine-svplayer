@@ -65,7 +65,6 @@ final class SoftwareEAC3AtmosDecoder: SoftwareAudioProducing, @unchecked Sendabl
     private let bytesPerFrame: Int
     private let bedFormat: CMAudioFormatDescription
     private let timeBase: AVRational
-    private let tap: LazyTapDecoder
     private var converter: AudioConverterRef?
     private let lock = NSLock()
     private var _feedEpoch: UInt64 = 0
@@ -122,7 +121,6 @@ final class SoftwareEAC3AtmosDecoder: SoftwareAudioProducing, @unchecked Sendabl
         self.bytesPerFrame = Int(out.mBytesPerFrame)
         self.bedFormat = bed
         self.timeBase = stream.pointee.time_base
-        self.tap = LazyTapDecoder(stream: stream)
         self.converter = made
         self.output = [UInt8](repeating: 0, count: Self.framesPerPacket * 2 * Int(out.mBytesPerFrame))
     }
@@ -252,7 +250,6 @@ final class SoftwareEAC3AtmosDecoder: SoftwareAudioProducing, @unchecked Sendabl
             pending.bytes = nil
             pending.consumed = true
         }
-        tap.flush()
     }
 
     func close() {
@@ -260,11 +257,5 @@ final class SoftwareEAC3AtmosDecoder: SoftwareAudioProducing, @unchecked Sendabl
             if let converter { AudioConverterDispose(converter) }
             converter = nil
         }
-        tap.close()
-    }
-
-    /// PCM for the audio tap, which wants the source's own channels: the 5.1 core, decoded by libavcodec.
-    func tapBuffers(for packet: UnsafeMutablePointer<AVPacket>, produced: [CMSampleBuffer]) -> [CMSampleBuffer] {
-        tap.buffers(for: packet)
     }
 }

@@ -44,6 +44,7 @@ final class IFramePayloadCache: @unchecked Sendable {
         guard !data.isEmpty else { return }
         lock.lock(); defer { lock.unlock() }
         forgetLocked(index)
+        guard data.count <= byteLimit else { return }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try data.write(to: url(index), options: .atomic)

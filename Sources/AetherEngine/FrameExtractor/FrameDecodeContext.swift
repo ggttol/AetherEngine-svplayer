@@ -38,6 +38,7 @@ final class FrameDecodeContext: @unchecked Sendable {
     private var boundedReader: IOReader?
 
     private var demuxer: Demuxer?
+    private var ownsDemuxer = true
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
     private var hardwareDeviceContext: UnsafeMutablePointer<AVBufferRef>?
     private var hardwareDecodeDisabled = false
@@ -215,7 +216,7 @@ final class FrameDecodeContext: @unchecked Sendable {
             sws_freeContext(swsContext)
             swsContext = nil
         }
-        demuxer?.close()
+        if ownsDemuxer { demuxer?.close() }
         demuxer = nil
         boundedReader?.close()
         boundedReader = nil
@@ -230,11 +231,14 @@ final class FrameDecodeContext: @unchecked Sendable {
         let demuxer = Demuxer()
         demuxer.probeControl = control
         if let control {
+            // SVPlayer modification: every byte of a source refinement belongs to its
+            // cancellable reader and budget, including during format detection.
+            demuxer.restrictToProvidedIO = true
             let source: IOReader
             if let reader {
                 source = reader
             } else if url.isFileURL {
-                guard let file = FileIOReader(url: url) else { throw DemuxerError.openFailed(code: -1) }
+                guard let file = FileIOReader(regularFile: url) else { throw DemuxerError.openFailed(code: -1) }
                 source = file
                 boundedReader = file
             } else if ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
@@ -264,8 +268,20 @@ final class FrameDecodeContext: @unchecked Sendable {
                              profile: DemuxerOpenProfile.stillExtraction.withRequestHeaders(requestHeaderStore),
                              selectTitleID: selectTitleID)
         }
-        self.demuxer = demuxer
+        try configureDecoder(for: demuxer)
+    }
 
+    /// The ladder's serialized side reader already owns a demuxer, its Range cursor and
+    /// its video index. Only the temporary codec context belongs to a finger refinement.
+    convenience init(borrowing demuxer: Demuxer) throws {
+        self.init(url: URL(fileURLWithPath: "/"), httpHeaders: [:])
+        ownsDemuxer = false
+        try configureDecoder(for: demuxer)
+        isOpen = true
+    }
+
+    private func configureDecoder(for demuxer: Demuxer) throws {
+        self.demuxer = demuxer
         let videoIdx = demuxer.videoStreamIndex
         guard videoIdx >= 0, let stream = demuxer.stream(at: videoIdx) else {
             throw FrameDecodeError.noVideoStream

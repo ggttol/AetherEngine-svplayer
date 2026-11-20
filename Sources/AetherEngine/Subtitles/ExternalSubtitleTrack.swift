@@ -56,7 +56,10 @@ public struct ExternalSubtitleTrack: Sendable, Equatable {
         case "srt", "subrip": return "subrip"
         case "ass", "ssa": return "ass"
         case "vtt", "webvtt": return "webvtt"
-        case "sup": return "pgssub"
+        // SVPlayer modification. Emby may expose a codec name where a sidecar has a file extension.
+        case "sup", "pgs", "pgssub", "hdmv_pgs_subtitle": return "pgssub"
+        case "idx", "sub", "vobsub", "dvdsub", "dvd_subtitle": return "dvd_subtitle"
+        case "dvbsub", "dvb_subtitle": return "dvb_subtitle"
         default: return "subrip"
         }
     }

@@ -28,9 +28,6 @@ protocol SoftwareAudioProducing: AnyObject, Sendable {
     /// The APAC encoder holds its last packets, `AudioDecoder` the sub-1024-sample remainder and the
     /// shaping graph's latency (AUD-205); a passthrough has nothing.
     func endOfStream() -> [CMSampleBuffer]
-    /// PCM for the audio tap, which feeds on decoded audio whatever the renderer was given.
-    /// `produced` is what `decode` returned for `packet`; a PCM producer hands it straight back.
-    func tapBuffers(for packet: UnsafeMutablePointer<AVPacket>, produced: [CMSampleBuffer]) -> [CMSampleBuffer]
     /// `LiveTelemetry.objectAudio`: what the object renderer is doing. nil for every producer but the
     /// APAC one, which renders TrueHD Atmos and DTS:X.
     var objectAudioActivity: ObjectAudioActivity? { get }
@@ -47,9 +44,6 @@ extension SoftwareAudioProducing {
     /// A PCM decode or a passthrough has its first buffer within a packet or two.
     var firstBufferPacketBudget: Int { 50 }
     func endOfStream() -> [CMSampleBuffer] { [] }
-    func tapBuffers(for packet: UnsafeMutablePointer<AVPacket>, produced: [CMSampleBuffer]) -> [CMSampleBuffer] {
-        produced
-    }
     var objectAudioActivity: ObjectAudioActivity? { nil }
 }
 

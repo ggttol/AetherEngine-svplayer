@@ -10,6 +10,8 @@ import AetherLibavutil
 /// AVPlayer by a local HTTP server that blocks on a condvar until the requested
 /// segment is muxed.
 public final class HLSVideoEngine: @unchecked Sendable {
+    // SVPlayer modification: one selected compressed-track history survives producer restarts.
+    let speechPackets = AudioPacketWindow()
 
     // MARK: - Errors
 
@@ -301,9 +303,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Configured before start; only controls the elective sparse still ladder.
     var generatesBackgroundScrubPreviews = true
 
-    /// Sparse stills for what nothing resident covers (`KeyframeStillLadder`). Eligibility is the
-    /// I-frame rule minus the serial-origin exclusion, because the ladder reads only while the origin
-    /// has nothing in flight. Guarded by `restartLock`, like the reader and builder below.
+    /// Sparse stills for ordinary seekable VOD on an idle, non-serial origin.
     private var stillLadderEligible = false
     private var stillLadderSource: (keyframes: IFrameRendition, builder: PreviewKeyframeBuilder)?
     /// The ladder also fills a served I-frame rendition ahead of AVKit, through the rendition's own
@@ -315,10 +315,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private var stillLadderCached: Set<Int> = []
     private var stillLadderFailures: [Int: Int] = [:]
     private var stillLadderReadInFlight = false
+    private var backgroundLadderRequest: ProbeCancellation?
+    private var scrubFinger = ScrubLadderFinger()
     private var stillLadderStartedAt: DispatchTime?
     private var stillLadderLastRungAt: DispatchTime?
     private var stillLadderComplete = false
-    /// The playhead of the latest engine tick, for the reads a finished window rung chains on.
+    private static let ladderImageBytes = 8 * 1024 * 1024
+    private var readyLadderFrames = ReadyScrubFrames(byteLimit: HLSVideoEngine.ladderImageBytes)
+    /// Playlist-axis playhead used to measure the buffer protecting an elective source read.
     private var stillLadderPlayhead: Double?
     private let stillLadderQueue = DispatchQueue(label: "aether.still-ladder", qos: .utility)
     nonisolated static let compositorPreviewFileLimit = 12
@@ -2741,13 +2745,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 isDiscSource: dem.isDiscSource,
                 secondReaderAvailable: sourceReopenableByURL)) == .served
         stillLadderLock.lock()
+        let obsolete = scrubFinger.move(to: nil, in: []) + [backgroundLadderRequest].compactMap { $0 }
+        backgroundLadderRequest = nil
         stillLadderStartedAt = .now()
+        readyLadderFrames = ReadyScrubFrames(byteLimit: Self.ladderImageBytes)
+        stillLadderReadInFlight = false
         stillLadderLastRungAt = nil
         stillLadderPlayhead = nil
         stillLadderCached.removeAll()
         stillLadderFailures.removeAll()
         stillLadderComplete = false
         stillLadderLock.unlock()
+        obsolete.forEach { $0.cancel() }
         let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
         // AE#187: tvOS HW HEVC needs the codec advertised in a master's CODECS attribute; a bare media
         // playlist (H.264 is fine media-direct) fails the item with tracks count=0 / -12848. Scope to
@@ -3441,27 +3450,118 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let fragment: Data
 
         func makeReader() -> DataIOReader { DataIOReader(parts: [initData, fragment]) }
+
+        /// SVPlayer modification: decode once on the serial ladder worker, while its bytes
+        /// are already in memory. The fragment's local zero stands for this rung's own PTS.
+        func decodedThumbnail(isCancelled: () -> Bool) -> ScrubFrame? {
+            guard !isCancelled(), startSeconds.isFinite, durationSeconds.isFinite, durationSeconds > 0 else { return nil }
+            let decoder = FrameDecodeContext(reader: makeReader(), formatHint: "mp4")
+            defer { decoder.close() }
+            do { try decoder.ensureOpen() } catch { return nil }
+            guard let image = decoder.decodeFrame(at: 0, mode: .thumbnail, targetWidth: 320,
+                                                  maxSize: CGSize(width: 320, height: 320),
+                                                  isCancelled: isCancelled, residentTarget: 0),
+                  !isCancelled() else { return nil }
+            return ScrubFrame(image: image, actualSeconds: startSeconds, refined: false,
+                              validRange: startSeconds..<(startSeconds + durationSeconds), source: .ladder)
+        }
+    }
+
+    func readyLadderFrame(at seconds: Double) -> ScrubFrame? {
+        stillLadderLock.withLock { readyLadderFrames }.nearest(to: seconds)
+    }
+
+    func updateScrubFinger(_ seconds: Double?, playhead: Double?) {
+        let plan = restartLock.withLock { stillLadderEligible ? segmentPlan : [] }
+        let obsolete = stillLadderLock.withLock { () -> [ProbeCancellation] in
+            if let playhead, playhead.isFinite { stillLadderPlayhead = playhead }
+            var stopped = scrubFinger.move(to: seconds, in: plan)
+            if seconds != nil, let backgroundLadderRequest { stopped.append(backgroundLadderRequest) }
+            return stopped
+        }
+        obsolete.forEach { $0.cancel() }
+    }
+
+    private func scrubReadAllowed(minimumBuffer: Double) -> Bool {
+        guard !restartInFlight, sideReaderLinkGate?.state.seeking != true else { return false }
+        if sourceURL.isFileURL { return true }
+        guard let playhead = stillLadderLock.withLock({ stillLadderPlayhead }),
+              contiguousForwardReadAheadSeconds(playlistSeconds: playhead) >= minimumBuffer else { return false }
+        let origin = OriginRequestBudget.shared.snapshot(for: sourceURL)
+        return (origin?.inflight ?? 0) == 0 && (origin?.waiting ?? 0) == 0 && origin?.paced != true
+            && (origin?.secondsSinceLastRefusal ?? .infinity) >= KeyframeStillLadder.refusalQuietSeconds
+            && !OriginRequestBudget.shared.requiresSerialRequests(sourceURL)
+    }
+
+    /// The finger's own keyframe takes the foreground turn, including when it is far outside
+    /// the background window. An in-flight read can finish for a new finger in the same segment.
+    func fingerLadderFrame(at output: Double, isCancelled: @escaping @Sendable () -> Bool) -> ScrubFrame? {
+        guard stillLadderLock.withLock({ scrubFinger.seconds == output }) else { return nil }
+        return stillLadderQueue.sync {
+            let token = ProbeCancellation()
+            guard !isCancelled(),
+                  let index = stillLadderLock.withLock({ scrubFinger.beginRung(at: output, using: token) }) else { return nil }
+            defer { stillLadderLock.withLock { scrubFinger.finish(token) } }
+            let plan = restartLock.withLock { stillLadderEligible ? segmentPlan : [] }
+            guard plan.indices.contains(index), !token.isCancelled else { return nil }
+            let entry = plan[index]
+            let images = stillLadderLock.withLock { readyLadderFrames }
+            if let hit = images.nearest(to: entry.startSeconds), hit.actualSeconds == entry.startSeconds { return hit }
+            guard abs(entry.startSeconds - output) <= KeyframeStillLadder.maximumAnswerDistanceSeconds,
+                  let source = makeStillLadderSource(plan: plan),
+                  let payload = source.keyframes.keyframePayload(at: index, cancellation: token,
+                      isStale: { token.isCancelled || !self.scrubReadAllowed(minimumBuffer: 8) }),
+                  !token.isCancelled,
+                  let built = source.builder.build(payload: payload, durationSeconds: entry.durationSeconds) else { return nil }
+            let rung = StillLadderFrame(segmentIndex: index, startSeconds: entry.startSeconds,
+                                        durationSeconds: entry.durationSeconds,
+                                        initData: built.initSegment, fragment: built.fragment)
+            guard let frame = rung.decodedThumbnail(isCancelled: { token.isCancelled }) else { return nil }
+            stillLadderLock.withLock {
+                if readyLadderFrames === images, !token.isCancelled {
+                    stillLadderCached.insert(index)
+                    images.insert(frame)
+                }
+            }
+            return token.isCancelled ? nil : frame
+        }
+    }
+
+    func refineScrubFinger(at output: Double, maxWidth: Int, cancellation: ProbeCancellation) -> ScrubFrame? {
+        guard !cancellation.isCancelled else { return nil }
+        let (accepted, obsolete) = stillLadderLock.withLock { scrubFinger.beginRefinement(at: output, using: cancellation) }
+        guard accepted else { return nil }
+        obsolete?.cancel()
+        defer { stillLadderLock.withLock { scrubFinger.finish(cancellation) } }
+        return stillLadderQueue.sync {
+            let plan = restartLock.withLock { stillLadderEligible ? segmentPlan : [] }
+            guard !cancellation.isCancelled, !plan.isEmpty, scrubReadAllowed(minimumBuffer: 8),
+                  let source = makeStillLadderSource(plan: plan) else { return nil }
+            let origin = firstKeyframeSeconds
+            return source.keyframes.refinedFrame(at: output + origin, maxWidth: maxWidth, cancellation: cancellation,
+                                                whenAllowed: { self.scrubReadAllowed(minimumBuffer: 8) })?.shifted(by: -origin)
+        }
+    }
+
+    enum LadderPreview: Sendable {
+        case ready(ScrubFrame)
+        case compressed(StillLadderFrame)
     }
 
     /// One 1 Hz tick from the engine: reads the next rung when the link is idle. Never blocks; the
     /// read runs on the ladder's own queue, one at a time.
     func stillLadderTick(playheadPlaylistSeconds playhead: Double, forwardBufferSeconds: Double) {
         guard playhead.isFinite else { return }
-        stillLadderLock.lock()
-        stillLadderPlayhead = playhead
-        stillLadderLock.unlock()
+        let background = stillLadderLock.withLock {
+            stillLadderPlayhead = playhead
+            return backgroundLadderRequest
+        }
+        if restartInFlight || sideReaderLinkGate?.state.seeking == true ||
+            forwardBufferSeconds < KeyframeStillLadder.minimumForwardBufferSeconds {
+            background?.cancel()
+            return
+        }
         stillLadderStep(playhead: playhead, forwardBufferSeconds: forwardBufferSeconds)
-    }
-
-    /// A window rung that landed asks for the next one at once instead of waiting for the tick, on
-    /// the newest playhead and a fresh buffer reading. The link check still runs before each read.
-    private func chainStillLadderRung() {
-        stillLadderLock.lock()
-        let playhead = stillLadderPlayhead
-        stillLadderLock.unlock()
-        guard let playhead else { return }
-        stillLadderStep(playhead: playhead,
-                        forwardBufferSeconds: contiguousForwardReadAheadSeconds(playlistSeconds: playhead))
     }
 
     private func stillLadderStep(playhead: Double, forwardBufferSeconds: Double) {
@@ -3469,7 +3569,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let now = DispatchTime.now()
         stillLadderLock.lock()
         let started = stillLadderStartedAt
-        let busy = stillLadderReadInFlight
+        let images = readyLadderFrames
+        let busy = stillLadderReadInFlight || scrubFinger.seconds != nil
         let sinceLast = stillLadderLastRungAt.map { Self.seconds(from: $0, to: now) }
         let skipped = stillLadderCached.union(stillLadderFailures.filter { $0.value >= 2 }.keys)
         stillLadderLock.unlock()
@@ -3477,7 +3578,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         restartLock.lock()
         let prefetching = iFramePrefetchActive
-        let eligible = stillLadderEligible || prefetching
+        let buildsScrubImage = stillLadderEligible
+        let eligible = buildsScrubImage || prefetching
         let buildsJPEG: Bool
         if prefetching, case .jpeg = iFrameRendition?.format { buildsJPEG = true } else { buildsJPEG = false }
         let plan = segmentPlan
@@ -3489,11 +3591,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // for it.
         let resident = prefetching ? [] : segmentCache?.residentIndexRanges() ?? []
         let starts = plan.map(\.startSeconds)
-        let window = prefetching ? KeyframeStillLadder.iFrameWindowSegments : 0
-        guard let index = KeyframeStillLadder.nextRung(
-            segmentStarts: starts, totalSeconds: last.startSeconds + last.durationSeconds,
-            playheadSeconds: playhead, fineWindowSegments: window, isCached: { skipped.contains($0) },
-            isResident: { idx in resident.contains { $0.contains(idx) } }) else {
+        let nearby = KeyframeStillLadder.nearbyRungs(segmentStarts: starts,
+                                                    totalSeconds: last.startSeconds + last.durationSeconds,
+                                                    playheadSeconds: playhead)
+        guard let index = nearby.first(where: { index in
+            !skipped.contains(index) && !resident.contains { $0.contains(index) }
+        }) else {
             // Rungs inside the resident window were skipped, so a window that moves on can open
             // the ladder again: this only keeps the line to one per completion.
             stillLadderLock.lock()
@@ -3506,9 +3609,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
             return
         }
-        let center = KeyframeStillLadder.planIndex(atOrBefore: playhead, in: starts) ?? 0
-        let inWindow = window > 0 && abs(index - center) <= window
-
         let origin = OriginRequestBudget.shared.snapshot(for: sourceURL)
         let link = KeyframeStillLadder.LinkState(
             restartInFlight: restartInFlight,
@@ -3520,52 +3620,69 @@ public final class HLSVideoEngine: @unchecked Sendable {
             originSerial: OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
             secondsSinceOriginRefusal: origin?.secondsSinceLastRefusal,
             secondsSinceSessionStart: Self.seconds(from: started, to: now),
-            secondsSinceLastRung: sinceLast,
-            minimumSpacingSeconds: inWindow ? KeyframeStillLadder.fineWindowSpacingSeconds
-                : KeyframeStillLadder.rungSpacingSeconds)
+            secondsSinceLastRung: sinceLast)
         guard KeyframeStillLadder.linkIsIdle(link) else { return }
 
         guard let source = makeStillLadderSource(plan: plan) else { return }
         // The JPEG fragment cache holds 128, so only the window around the playhead is built ahead.
-        let buildsFragment = buildsJPEG && inWindow
+        let buildsFragment = buildsJPEG
 
         stillLadderLock.lock()
-        // A chained step and the engine tick can both get here; only one of them reads.
-        guard !stillLadderReadInFlight else { stillLadderLock.unlock(); return }
+        guard !stillLadderReadInFlight, scrubFinger.seconds == nil, readyLadderFrames === images else { stillLadderLock.unlock(); return }
+        let cancellation = ProbeCancellation()
+        backgroundLadderRequest = cancellation
         stillLadderReadInFlight = true
         stillLadderComplete = false
         stillLadderLastRungAt = now
         stillLadderLock.unlock()
         stillLadderQueue.async { [weak self] in
             let started = DispatchTime.now()
-            let payload = source.keyframes.prefetch(at: index, buildsFragment: buildsFragment)
             guard let self else { return }
+            let payload = source.keyframes.prefetch(at: index, buildsFragment: buildsFragment, cancellation: cancellation,
+                                                   whenAllowed: { self.scrubReadAllowed(minimumBuffer: KeyframeStillLadder.minimumForwardBufferSeconds) })
             let ms = Self.seconds(from: started, to: .now()) * 1000
+            let isRetired = { self.stillLadderLock.withLock { self.readyLadderFrames !== images } }
+            guard !isRetired() else { return }
+            var imageReady = false
+            if buildsScrubImage, !cancellation.isCancelled, let payload,
+               let built = source.builder.build(payload: payload, durationSeconds: plan[index].durationSeconds) {
+                let rung = StillLadderFrame(segmentIndex: index, startSeconds: starts[index],
+                                            durationSeconds: plan[index].durationSeconds,
+                                            initData: built.initSegment, fragment: built.fragment)
+                if let still = rung.decodedThumbnail(isCancelled: { cancellation.isCancelled || isRetired() }) {
+                    images.insert(still)
+                    imageReady = true
+                }
+            }
+            let recordMiss = payload == nil && !cancellation.isCancelled
+                && self.scrubReadAllowed(minimumBuffer: KeyframeStillLadder.minimumForwardBufferSeconds)
             self.stillLadderLock.lock()
+            guard self.readyLadderFrames === images else { self.stillLadderLock.unlock(); return }
             self.stillLadderReadInFlight = false
+            self.backgroundLadderRequest = nil
             if payload != nil {
                 self.stillLadderCached.insert(index)
-            } else {
+            } else if recordMiss {
                 self.stillLadderFailures[index, default: 0] += 1
             }
             let count = self.stillLadderCached.count
             self.stillLadderLock.unlock()
             EngineLog.emit("[StillLadder] rung idx=\(index) at \(String(format: "%.0f", starts[index]))s "
                            + (payload.map { "read \($0.count) B" } ?? "not read")
-                           + " in \(String(format: "%.0f", ms))ms (\(count) cached)",
+                           + " in \(String(format: "%.0f", ms))ms (\(count) cached) imageReady=\(imageReady)",
                            category: .session,
                            level: payload == nil || count == 1 || count % 25 == 0 ? .info : .verbose)
             // A miss waits for the tick, so a failing origin is not asked again in a tight loop.
-            if payload != nil, inWindow { self.chainStillLadderRung() }
         }
     }
 
     /// The cached rung that answers a scrub at `seconds` (playlist/output axis), built into a
     /// standalone fMP4. Cache only: a miss never touches the source.
-    func stillLadderFrame(atSeconds seconds: Double) -> StillLadderFrame? {
+    func stillLadderFrame(atSeconds seconds: Double, maxWidth: Int) -> LadderPreview? {
         guard !isLiveSession, seconds.isFinite else { return nil }
         stillLadderLock.lock()
         let cached = Array(stillLadderCached)
+        let images = readyLadderFrames
         stillLadderLock.unlock()
         guard !cached.isEmpty else { return nil }
         restartLock.lock()
@@ -3576,18 +3693,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
         guard let source,
               let index = KeyframeStillLadder.answeringRung(
                 for: seconds, segmentStarts: plan.map(\.startSeconds), cached: cached) else { return nil }
+        let segment = plan[index]
+        if maxWidth == 320, let ready = images.nearest(to: segment.startSeconds),
+           ready.actualSeconds == segment.startSeconds { return .ready(ready) }
         guard let payload = source.keyframes.cachedKeyframePayload(at: index) else {
             stillLadderLock.lock()
             stillLadderCached.remove(index)
             stillLadderLock.unlock()
             return nil
         }
-        let segment = plan[index]
         guard let built = source.builder.build(payload: payload, durationSeconds: segment.durationSeconds)
         else { return nil }
-        return StillLadderFrame(segmentIndex: index, startSeconds: segment.startSeconds,
-                                durationSeconds: segment.durationSeconds,
-                                initData: built.initSegment, fragment: built.fragment)
+        return .compressed(StillLadderFrame(segmentIndex: index, startSeconds: segment.startSeconds,
+                                            durationSeconds: segment.durationSeconds,
+                                            initData: built.initSegment, fragment: built.fragment))
     }
 
     /// The ladder's own side reader and builder, made on the first rung. Its reads are gated on the
@@ -3620,7 +3739,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             let made = (rendition, builder)
             stillLadderSource = made
             EngineLog.emit("[StillLadder] reading through the I-frame rendition (segments=\(plan.count), "
-                           + "window=\(KeyframeStillLadder.iFrameWindowSegments), format=\(rendition.format.logName))",
+                           + "radiusSeconds=\(KeyframeStillLadder.radius), spacingSeconds=\(KeyframeStillLadder.spacing), "
+                           + "format=\(rendition.format.logName))",
                            category: .session)
             return made
         }
@@ -3741,6 +3861,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let ladder = stillLadderSource
         stillLadderSource = nil
         stillLadderEligible = false
+        let obsoleteScrub = stillLadderLock.withLock {
+            let stopped = scrubFinger.move(to: nil, in: []) + [backgroundLadderRequest].compactMap { $0 }
+            backgroundLadderRequest = nil
+            readyLadderFrames = ReadyScrubFrames(byteLimit: Self.ladderImageBytes)
+            stillLadderReadInFlight = false
+            stillLadderStartedAt = nil
+            stillLadderPlayhead = nil
+            return stopped
+        }
         iFramePrefetchActive = false
         closeUnusedCustomIFrameReader()
         savedVideoConfig = nil
@@ -3756,6 +3885,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         reopenCustomReader = nil
         segmentPlan = []
         restartLock.unlock()
+        obsoleteScrub.forEach { $0.cancel() }
         reopening?.markClosed()
         // The restart that opened it closes it once it sees the epoch moved.
         restartReopening?.markClosed()
@@ -3904,7 +4034,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             entries: entries,
             cache: cache,
             format: format,
-            readPayload: { reader.payload(startPts: $0.startPts) },
+            readPayload: { reader.payload(startPts: $0.startPts, cancellation: $1) },
+            refine: { reader.refinedFrame(at: $0, maxWidth: $1, cancellation: $2) },
             buildFragment: buildFragment,
             waitForLink: { [weak self] shouldStop in
                 // A seek or a producer restart owns the link for a moment; a thumbnail can wait that
@@ -3941,9 +4072,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
         restartLock.unlock()
         if ladderShared {
             stillLadderLock.lock()
+            let obsolete = scrubFinger.move(to: nil, in: []) + [backgroundLadderRequest].compactMap { $0 }
+            backgroundLadderRequest = nil
+            readyLadderFrames = ReadyScrubFrames(byteLimit: Self.ladderImageBytes)
+            stillLadderReadInFlight = false
             stillLadderCached.removeAll()
             stillLadderFailures.removeAll()
             stillLadderLock.unlock()
+            obsolete.forEach { $0.cancel() }
         }
         DispatchQueue.global(qos: .utility).async { rendition.shutdown() }
     }
@@ -4060,6 +4196,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // below. The side readers read one gate for the whole session, so a restart must not leave
         // a gap where nobody claims the link.
         prod.sideReaderLinkGate = sideReaderLinkGate
+        if let track = savedAudioConfig {
+            (sideAudioDemuxer ?? dem).withStream(at: track.sourceStreamIndex) { stream in
+                speechPackets.configure(stream: stream, epoch: producerEpoch,
+                                        sameSourceAcrossEpochs: !isLiveSession && !sequentialOriginPinsProducerToZero)
+            }
+            prod.speechPackets = speechPackets
+        }
         prod.playedMediaLedger = playedMediaLedger
         prod.sourceAnnouncesDiscontinuities = liveSourceAnnouncesDiscontinuities
         prod.onFirstHDR10PlusDetected = { [weak self] in

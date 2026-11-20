@@ -343,6 +343,9 @@ extension AetherEngine {
                 // `.ended` is terminal (#63/#164), so forwarding it here would turn a source hiccup into
                 // a dead session for the rest of the tune.
                 if self.handleLiveOutageWindowExhausted() { return }
+                // SVPlayer modification. Let the worker drain selected packets and its decoder,
+                // including when native playback ends against previously produced segments.
+                self.speechPacketHistory?.setPlaybackEnded(true)
                 self.state = .ended
             }
             .store(in: &cancellables)
@@ -2365,8 +2368,9 @@ extension AetherEngine {
             .sink { [weak self] value in
                 guard let self = self else { return }
                 self.clock.currentTime = value
-                self.clock.sourceTime = value
                 // No buffer-ahead surface on this path; mirror playhead so bufferedPosition stays defined (#54).
+                // SVPlayer modification. Audio-only tap and picture clocks share the raw source axis.
+                self.clock.sourceTime = host.sourceSeconds(forSession: value)
                 self.clock.bufferedPosition = value
             }
             .store(in: &audioCancellables)

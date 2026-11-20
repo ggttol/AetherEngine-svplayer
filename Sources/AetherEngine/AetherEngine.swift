@@ -365,6 +365,11 @@ public final class AetherEngine: ObservableObject {
     func emitSeekEvent(id: UInt64, origin: SeekEvent.Origin, outcome: SeekEvent.Outcome, target: Double,
                        departure: Double? = nil) {
         let event = SeekEvent(id: id, origin: origin, outcome: outcome, target: target, departure: departure)
+        // SVPlayer modification: fence PCM before clients receive the seek ticket.
+        if case .began = outcome {
+            removeAudioTap()
+            speechPacketHistory?.setPlaybackEnded(false)
+        }
         EngineLog.emit("[AetherEngine] \(event)", category: .engine)
         seekEventSubject.send(event)
     }
@@ -1037,6 +1042,12 @@ public final class AetherEngine: ObservableObject {
     /// the same value against `clock.sourceTime`. Native AVPlayer renditions are not affected.
     /// Persists across loads on this engine, like a host presentation preference.
     public private(set) var softwareSubtitleDelaySeconds: Double = 0
+
+    /// SVPlayer modification. Standalone sidecars use movie-relative timestamps. Offset their
+    /// packets onto the source PTS axis before the bitmap drainer, overlay and PiP compositor.
+    public var usesMediaRelativeSidecarTimestamps = false
+
+    var sidecarSourceOrigin: Double { usesMediaRelativeSidecarTimestamps ? sourceTimeAtPresentationZero : 0 }
 
     /// Updates software subtitle composition without reopening media or shifting the A/V clock.
     /// Non-finite values are ignored. Takes effect on the next composited video frame.
@@ -2663,6 +2674,7 @@ public final class AetherEngine: ObservableObject {
 
     /// Distinct across engine instances and refreshed whenever teardown invalidates preview work.
     public private(set) var scrubPreviewSourceGeneration = UUID()
+    var recentScrubFrames = ReadyScrubFrames(byteLimit: 4 * 1024 * 1024)
 
     /// #361: generation of the startup the user is currently waiting through. Deliberately NOT
     /// `loadGeneration`, which counts teardowns: an engine-initiated reroute (an HLS playlist found
@@ -9009,6 +9021,7 @@ public final class AetherEngine: ObservableObject {
         loadGeneration &+= 1
         clearDisplaySwitchGate()
         scrubPreviewSourceGeneration = UUID()
+        recentScrubFrames = ReadyScrubFrames(byteLimit: 4 * 1024 * 1024)
         resumeAfterInterruption = false
         playDeferredByInterruption = false
         audioInterruptionActive = false

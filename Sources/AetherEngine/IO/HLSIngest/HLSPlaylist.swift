@@ -91,15 +91,24 @@ struct HLSMediaSegment: Equatable {
     let programDateTime: Date?
     /// Nil when the segment is its whole resource.
     let byteRange: HLSByteRange?
+    // SVPlayer modification: a captured fMP4 segment needs the initialization section
+    // and encryption context in effect at its own position in the playlist.
+    struct Initialization: Equatable {
+        let uri: String
+        let byteRange: HLSByteRange?
+        let crypt: HLSSegmentCrypt?
+    }
+    let initialization: Initialization?
 
     init(uri: String, duration: Double, discontinuityBefore: Bool, crypt: HLSSegmentCrypt? = nil,
-         programDateTime: Date? = nil, byteRange: HLSByteRange? = nil) {
+         programDateTime: Date? = nil, byteRange: HLSByteRange? = nil, initialization: Initialization? = nil) {
         self.uri = uri
         self.duration = duration
         self.discontinuityBefore = discontinuityBefore
         self.crypt = crypt
         self.programDateTime = programDateTime
         self.byteRange = byteRange
+        self.initialization = initialization
     }
 }
 
@@ -218,6 +227,7 @@ enum HLSPlaylistParser {
         var isEncrypted = false
         var hasUnsupportedEncryption = false
         var hasMap = false
+        var initialization: HLSMediaSegment.Initialization?
         var pendingDuration: Double?
         var pendingDiscontinuity = false
         // AES-128 keys are "sticky": one EXT-X-KEY tag governs all following segments until the next tag. Pluto/Samsung-TV+ emit one tag per segment with the same URI and an incrementing explicit IV.
@@ -278,6 +288,21 @@ enum HLSPlaylistParser {
                 pendingByteRange = try parseByteRange(line.dropFirst("#EXT-X-BYTERANGE:".count))
             } else if line.hasPrefix("#EXT-X-MAP:") {
                 hasMap = true
+                guard let uri = attribute("URI", in: line) else {
+                    throw HLSIngestError.playlistInvalid(reason: "missing MAP URI")
+                }
+                var mapRange: HLSByteRange?
+                if let value = attribute("BYTERANGE", in: line) {
+                    let parsed = try parseByteRange(value[...])
+                    let offset = parsed.offset ?? 0
+                    guard offset <= Int.max - parsed.length else {
+                        throw HLSIngestError.playlistInvalid(reason: "MAP BYTERANGE out of range")
+                    }
+                    mapRange = HLSByteRange(offset: offset, length: parsed.length)
+                }
+                if currentKeyURI != nil, currentExplicitIV == nil { hasUnsupportedEncryption = true }
+                let crypt = currentKeyURI.flatMap { key in currentExplicitIV.map { HLSSegmentCrypt(keyURI: key, iv: $0) } }
+                initialization = .init(uri: uri, byteRange: mapRange, crypt: crypt)
             } else if line.hasPrefix("#EXT-X-ENDLIST") {
                 hasEndList = true
             } else if !line.hasPrefix("#") {
@@ -317,7 +342,8 @@ enum HLSPlaylistParser {
                     discontinuityBefore: pendingDiscontinuity,
                     crypt: crypt,
                     programDateTime: segmentDate,
-                    byteRange: byteRange
+                    byteRange: byteRange,
+                    initialization: initialization
                 ))
                 pendingDuration = nil
                 pendingDiscontinuity = false

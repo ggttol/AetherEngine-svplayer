@@ -508,6 +508,13 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// Frames handed to a healthy queue whose time the clock has not passed yet, in source seconds,
     /// oldest first. Guarded by `reorderLock`.
     private var _pendingPresentation: [Double] = []
+    /// SVPlayer modification. The software host drains only frames accepted by a healthy display queue.
+    var latestPendingPresentationSeconds: Double? {
+        guard queueFlushReasonNow() == nil else { return nil }
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return _pendingPresentation.max()
+    }
     private var _presentedFrameCount = 0
     private static let pendingPresentationCapacity = 256
 

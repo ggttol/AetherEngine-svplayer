@@ -58,8 +58,6 @@ final class SoftwareEAC3Passthrough: SoftwareAudioProducing, @unchecked Sendable
 
     private let formatDescription: CMAudioFormatDescription
     private let timeBase: AVRational
-    /// Decodes for the audio tap only: `decode` itself never runs it.
-    private let tap: LazyTapDecoder
     private let lock = NSLock()
     /// Where the next packet sits when the container left its stamps out.
     private var nextSeconds: Double?
@@ -67,7 +65,6 @@ final class SoftwareEAC3Passthrough: SoftwareAudioProducing, @unchecked Sendable
     init(stream: UnsafeMutablePointer<AVStream>, formatDescription: CMAudioFormatDescription) throws {
         self.formatDescription = formatDescription
         self.timeBase = stream.pointee.time_base
-        self.tap = LazyTapDecoder(stream: stream)
     }
 
     // MARK: - Format description
@@ -226,14 +223,7 @@ final class SoftwareEAC3Passthrough: SoftwareAudioProducing, @unchecked Sendable
         lock.lock()
         nextSeconds = nil
         lock.unlock()
-        tap.flush()
     }
 
-    func close() {
-        tap.close()
-    }
-
-    func tapBuffers(for packet: UnsafeMutablePointer<AVPacket>, produced: [CMSampleBuffer]) -> [CMSampleBuffer] {
-        tap.buffers(for: packet)
-    }
+    func close() {}
 }

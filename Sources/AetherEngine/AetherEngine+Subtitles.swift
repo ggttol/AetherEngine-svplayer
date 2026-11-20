@@ -314,7 +314,9 @@ extension AetherEngine {
     /// Build a fresh overlay decoder for the stream on whichever host owns the session demuxer.
     func makeSubtitleDrainDecoder(channel: SubtitleChannel, streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
         if let source = sidecarBitmapSources[channel] {
-            return source.makeDecoder(sourceIsPQ: sourceIsPQForBitmapSubtitles)
+            return source.makeDecoder(sourceVideoWidth: sourceVideoWidth > 0 ? sourceVideoWidth : 1920,
+                                      sourceVideoHeight: sourceVideoHeight > 0 ? sourceVideoHeight : 1080,
+                                      sourceIsPQ: sourceIsPQForBitmapSubtitles)
         }
         return makeSubtitleDrainDecoder(streamIndex: streamIndex)
     }
@@ -1804,10 +1806,11 @@ extension AetherEngine {
             defaultHeaders: loadedOptions.httpHeaders, mediaURL: loadedURL)
         guard !jobs.isEmpty else { return }
         jobs.forEach { $0.markPending() }
+        let origin = sidecarSourceOrigin
         externalNativeStoreFillTask = BlockingWork.detached(priority: .utility) { [jobs] in
             for job in jobs {
                 if Task.isCancelled { return }
-                await AetherEngine.runExternalSubtitleFill(job: job)
+                await AetherEngine.runExternalSubtitleFill(job: job, sourceOrigin: origin)
             }
         }
     }
@@ -1818,11 +1821,11 @@ extension AetherEngine {
     /// store that could not be filled stays UNfinished, so the overlay never backfills a blank track
     /// from it, and is marked failed (AE#984), so its rendition is answered at once instead of
     /// holding AVPlayer for a file that is not coming.
-    nonisolated static func runExternalSubtitleFill(job: ExternalSubtitleFillJob) async {
+    nonisolated static func runExternalSubtitleFill(job: ExternalSubtitleFillJob, sourceOrigin: Double = 0) async {
         job.markPending()
         if let results = try? await SubtitleDecoder.decodeFile(
             url: job.url, httpHeaders: job.headers,
-            sourceStreamIndices: job.targets.map(\.streamIndex), formatHint: job.formatHint
+            sourceStreamIndices: job.targets.map(\.streamIndex), formatHint: job.formatHint, sourceOrigin: sourceOrigin
         ) {
             for (target, result) in zip(job.targets, results) {
                 target.store.appendCues(result.cues)
@@ -1840,7 +1843,7 @@ extension AetherEngine {
             if Task.isCancelled { return }
             guard let result = try? await SubtitleDecoder.decodeFile(
                 url: job.url, httpHeaders: job.headers, sourceStreamIndex: target.streamIndex,
-                formatHint: job.formatHint
+                formatHint: job.formatHint, sourceOrigin: sourceOrigin
             ) else {
                 if !Task.isCancelled { target.store.markExternalFillFailed() }
                 EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent) stream=\(target.streamIndex.map(String.init) ?? "auto")", category: .engine)
@@ -1909,6 +1912,7 @@ extension AetherEngine {
         let preparationPolicy = registered?.preparationPolicy
         let formatHint = registered?.formatHint
         let preserveASS = loadedOptions.preserveASSMarkup
+        let origin = sidecarSourceOrigin
         sidecarTask = Task { [weak self] in
             let result: SidecarDecodeResult
             do {
@@ -1916,7 +1920,7 @@ extension AetherEngine {
                     url: url, httpHeaders: effectiveHeaders,
                     preserveASSMarkup: preserveASS,
                     sourceStreamIndex: sourceStreamIndex, preparationPolicy: preparationPolicy,
-                    keepsBitmapPackets: true, formatHint: formatHint
+                    keepsBitmapPackets: true, formatHint: formatHint, sourceOrigin: origin
                 )
             } catch {
                 EngineLog.emit("[AetherEngine] sidecar decode failed: \(error)", category: .engine)
@@ -2030,8 +2034,11 @@ extension AetherEngine {
         let preparationPolicy = selectedExternal?.preparationPolicy
         let formatHint = selectedExternal?.formatHint
         let preserveASS = loadedOptions.preserveASSMarkup
+        let origin = sidecarSourceOrigin
         let sessionGeneration = loadGeneration
         let sourceIsPQ = sourceIsPQForBitmapSubtitles
+        let codedWidth = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
+        let codedHeight = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
         #if DEBUG
         let decoderFactory = secondarySidecarDecoderFactoryForTesting
         #endif
@@ -2041,7 +2048,7 @@ extension AetherEngine {
                 result = try await SubtitleDecoder.decodeFile(
                     url: url, httpHeaders: effectiveHeaders, preserveASSMarkup: preserveASS,
                     sourceStreamIndex: sourceStreamIndex, preparationPolicy: preparationPolicy,
-                    keepsBitmapPackets: true, formatHint: formatHint)
+                    keepsBitmapPackets: true, formatHint: formatHint, sourceOrigin: origin)
             } catch {
                 EngineLog.emit("[AetherEngine] secondary sidecar decode failed: \(error)", category: .engine)
                 await MainActor.run {
@@ -2058,7 +2065,9 @@ extension AetherEngine {
                     #if DEBUG
                     if let decoderFactory { return PreparedSidecarDecoder(decoder: decoderFactory(source)) }
                     #endif
-                    return PreparedSidecarDecoder(decoder: source.makeDecoder(sourceIsPQ: sourceIsPQ))
+                    return PreparedSidecarDecoder(decoder: source.makeDecoder(sourceVideoWidth: codedWidth,
+                                                                             sourceVideoHeight: codedHeight,
+                                                                             sourceIsPQ: sourceIsPQ))
                 }.value
                 bitmapDecoder = prepared.decoder
             } else {

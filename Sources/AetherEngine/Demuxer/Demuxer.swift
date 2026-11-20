@@ -347,6 +347,7 @@ public final class Demuxer: @unchecked Sendable {
     private var closeRequested = false
     private var isCloseRequested: Bool { closeRequestLock.withLock { closeRequested } }
     private var openProfile: DemuxerOpenProfile = .playback
+    var restrictToProvidedIO = false
 
     /// Audit NAT-7: the stream pointers `stream(at:)` hands out, copied out of `formatContext`
     /// under `accessLock`. MPEG-TS adds streams inside `av_read_frame`, which reallocates the
@@ -1119,6 +1120,9 @@ public final class Demuxer: @unchecked Sendable {
             throw DemuxerError.openFailed(code: -1)
         }
         ctx.pointee.pb = provider.context
+        if restrictToProvidedIO {
+            ctx.pointee.io_open = { _, _, _, _, _ in -EPERM }
+        }
         applyProbeBudget(ctx)
         formatContext = ctx
 

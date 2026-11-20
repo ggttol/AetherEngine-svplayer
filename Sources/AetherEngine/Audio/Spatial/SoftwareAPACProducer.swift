@@ -24,8 +24,6 @@ final class SoftwareAPACProducer: SoftwareAudioProducing, @unchecked Sendable {
     /// loopback route does. Behind the bridge's activity lock, never its feed lock.
     var objectAudioActivity: ObjectAudioActivity? { bridge.objectAudioActivity }
     private let sampleRate = Double(SpatialAudioBridge.sampleRate)
-    /// PCM for the audio tap, which wants the 7.1 channel presentation the renderer is not given.
-    private let tap: LazyTapDecoder
     private let lock = NSLock()
     private var loggedFeedError = false
     /// Serializes a feed with `flush()`, so the epoch check and the bridge feed are one step: a packet
@@ -35,9 +33,8 @@ final class SoftwareAPACProducer: SoftwareAudioProducing, @unchecked Sendable {
     private let feedLock = NSLock()
     private var _feedEpoch: UInt64 = 0
 
-    init(bridge: SpatialAudioBridge, stream: UnsafeMutablePointer<AVStream>) {
+    init(bridge: SpatialAudioBridge) {
         self.bridge = bridge
-        self.tap = LazyTapDecoder(stream: stream)
     }
 
     var feedEpoch: UInt64 { feedLock.withLock { _feedEpoch } }
@@ -125,16 +122,10 @@ final class SoftwareAPACProducer: SoftwareAudioProducing, @unchecked Sendable {
             _feedEpoch &+= 1
             bridge.startSegment()
         }
-        tap.flush()
     }
 
     func close() {
         bridge.close()
-        tap.close()
-    }
-
-    func tapBuffers(for packet: UnsafeMutablePointer<AVPacket>, produced: [CMSampleBuffer]) -> [CMSampleBuffer] {
-        tap.buffers(for: packet)
     }
 }
 #endif

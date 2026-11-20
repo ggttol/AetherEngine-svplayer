@@ -12,6 +12,8 @@ import AetherLibavutil
 /// `ObjectAudioRendering` asks for it (see `SoftwareAtmosRoute`). Everything else decodes to PCM.
 @MainActor
 final class SoftwarePlaybackHost {
+    // SVPlayer modification: compressed audio is available even when the renderer gets passthrough.
+    let speechPackets = AudioPacketWindow(deduplicatesReplay: true)
     /// Codecs whose presentation reordering has an established bound get the read-ahead's
     /// successor-PTS coverage; every other codec keeps strict packet-duration coverage. HEVC's bound
     /// is FFmpeg's own: `sps_max_num_reorder_pics > HEVC_MAX_DPB_SIZE - 1` (15) is rejected
@@ -815,6 +817,7 @@ final class SoftwarePlaybackHost {
     /// AE#374: end of media parks the clock exactly once. Both demux loops can reach `onEnd`, and the
     /// park is deferred by the queued audio tail, so the guard covers a second arrival mid-defer.
     private var didParkClockAtEnd = false
+    private var pendingEndTail: SoftwareEndOfMediaClock.PendingTail?
 
     /// AE#1024: the seek generation whose end of file arrived under a host pause, or nil. `play()` finishes
     /// it; a seek drops it, and the generation check keeps a queued end from landing on a later position.
@@ -1609,6 +1612,7 @@ final class SoftwarePlaybackHost {
                 self.audioRouteTakesAtmosActivator = made.route.takesAtmosOutputActivator
                 self.audioStreamIndex = resolvedAudioIdx
                 let atb = aStream.pointee.time_base
+                speechPackets.configure(stream: aStream, epoch: 0)
                 self.audioTimeBaseSeconds = atb.den > 0 ? Double(atb.num) / Double(atb.den) : 0
             } catch is CancellationError {
                 // stop() landed while the audio route was being chosen; the demuxer is closing.
@@ -1752,6 +1756,7 @@ final class SoftwarePlaybackHost {
             let initialSourceClock = initialClockTime.seconds
             let videoReorderDepth = Self.presentationReorderDepth(codecID: vCodecID)
             let anchorsOnLastKeyframe = snapsSeeksToKeyframes
+            let speechHistory = speechPackets
             let cacheResult = await BlockingWork.detached(priority: .utility) { () throws -> (SoftwarePacketReadAhead, RetentionClaims.Claim?)? in
                 let segments = HLSVideoEngine.clampedForwardWindow(forwardBufferSegments)
                 guard let (fifo, bytes, claim) = try Self.makePacketStore(
@@ -1764,8 +1769,12 @@ final class SoftwarePlaybackHost {
                     videoReorderDepth: videoReorderDepth, cacheTiming: cacheTiming,
                     anchorsOnLastKeyframe: anchorsOnLastKeyframe
                 ) { isCurrent in
-                    guard let packet = try dem.readPacket(isCurrent: isCurrent) else { return nil }
+                    guard let packet = try dem.readPacket(isCurrent: isCurrent) else {
+                        if isCurrent() { speechHistory.finish() }
+                        return nil
+                    }
                     defer { av_packet_unref(packet); av_packet_free_safe(packet) }
+                    if packet.pointee.stream_index == audio?.index { speechHistory.append(packet) }
                     return try SoftwareStoredPacket(copying: packet)
                 }
                 claim?.track { [weak readAhead] in readAhead?.snapshot.residentBytes ?? 0 }
@@ -1831,6 +1840,7 @@ final class SoftwarePlaybackHost {
 
     func play() {
         guard !stopRequested, failure == nil else { return }
+        if !isPlaying { pendingEndTail?.resumed(now: ProcessInfo.processInfo.systemUptime) }
         renderer.recoverAfterSuspensionIfNeeded()
         audioOutput?.setPlaybackEnabled(true)
         // Resume after pause(): gate on clockArmed, not demuxLoopStarted. A rate change on the
@@ -1868,15 +1878,9 @@ final class SoftwarePlaybackHost {
 
     private var demuxLoopStarted: Bool = false
 
-    /// #95 audio tap: mirrors every decoded audio CMSampleBuffer to the tap (nil = tap off).
-    /// Set/cleared on the main actor by AetherEngine+AudioTap; read per packet on the demux and
-    /// feeder threads (same unsynchronized-flag pattern as `_isPlaying`; worst case one buffer
-    /// reaches a just-removed sink).
-    nonisolated(unsafe) var audioTapSink: (@Sendable (CMSampleBuffer) -> Void)?
-
     /// #112 rework subtitle tap: the demux loop hands every embedded subtitle packet to this
     /// sink (nil = tap off), which copies the payload into the session's SubtitlePacketStore.
-    /// Same unsynchronized-flag pattern as `audioTapSink`; the sink copies synchronously, so
+    /// The sink copies synchronously, so
     /// the packet pointer never escapes the demux thread. The trailing Bool marks packets of
     /// split-PES PGS streams (MPEG-TS) that need display-set reassembly in the store.
     nonisolated(unsafe) var subtitleTapSink: (@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?
@@ -2033,39 +2037,30 @@ final class SoftwarePlaybackHost {
 
     private func finishAtEndOfMedia() {
         endOfMediaOwedOnPlay = nil
-        parkClockAtEndOfMedia()
-        didReachEnd = true
-        isPlaying = false
-    }
-
-    /// AE#374: stop the master clock on the last sample instead of letting it free-run past the end.
-    ///
-    /// `.ended` is terminal, so nothing will consume the clock again, but the synchronizer used to keep
-    /// its rate: `currentTime` then walked past `duration` without bound (measured: 20.13 s published on
-    /// a 12.0 s source, against a native session that parks on 11.97 s and stays there). Deferred by the
-    /// audio still queued ahead of the playhead, because parking the synchronizer stops its renderers
-    /// too and an immediate park would cut that tail. `pausedByHost` stays false: the viewer did not
-    /// pause this, the source ran out.
-    private func parkClockAtEndOfMedia() {
-        guard !didParkClockAtEnd else { return }
-        didParkClockAtEnd = true
-        guard clockArmed, let aOut = audioOutput else { return }
-        let tail = SoftwareEndOfMediaClock.tailPlayoutSeconds(
-            clockSeconds: aOut.currentTimeSeconds,
-            lastAudioPts: demuxDiag.snapshot.lastAudioPts
-        )
-        guard tail > 0 else { return parkClockNow() }
-        // The deferral aims at the end of the queued tail; a task that runs late must not park past it.
-        let target = aOut.currentTimeSeconds + tail
-        let generation = seekGeneration
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(tail * 1_000_000_000))
-            guard let self, self.admitsRead(generation: generation) else { return }
-            self.parkClockNow(notAfter: target)
+        guard !didParkClockAtEnd, pendingEndTail == nil else { return }
+        if clockArmed, let output = audioOutput {
+            pendingEndTail = .init(clock: output.currentTimeSeconds, audioEnd: output.enqueuedEndSeconds,
+                                   videoPTS: renderer.latestPendingPresentationSeconds, now: ProcessInfo.processInfo.systemUptime)
+            if pendingEndTail != nil { return }
         }
+        publishEndOfMedia()
     }
 
-    private func parkClockNow(notAfter latest: Double = .infinity) {
+    /// SVPlayer modification. Publishing the terminal state lets the app pause or replace the host immediately.
+    /// Schedule that publication from the render clock after the final queued audio and picture have played.
+    private func publishEndOfMedia() {
+        let target = pendingEndTail?.target ?? .infinity
+        pendingEndTail = nil
+        didParkClockAtEnd = true
+        if clockArmed, let output = audioOutput {
+            parkClockNow(notAfter: target)
+            publishPlayhead(output.currentTimeSeconds)
+        }
+        isPlaying = false
+        didReachEnd = true
+    }
+
+    private func parkClockNow(notAfter latest: Double) {
         guard !stopRequested, let aOut = audioOutput else { return }
         aOut.pause(notAfter: latest)
         rate = 0
@@ -2521,6 +2516,7 @@ final class SoftwarePlaybackHost {
         residentRangePublication.invalidate()
         didReachEnd = false
         endOfMediaOwedOnPlay = nil
+        pendingEndTail = nil
         didParkClockAtEnd = false
         didEmitParkedDiag = false
         let packetSource = vodPacketReadAhead
@@ -2884,7 +2880,7 @@ final class SoftwarePlaybackHost {
         audioStreamIndex: Int32,
         videoTimeBaseSeconds: Double,
         audioTimeBaseSeconds: Double,
-        audioTapSink: (@Sendable (CMSampleBuffer) -> Void)?,
+        speechPackets: AudioPacketWindow?,
         audioEpoch: UInt64,
         noteDecodeGeneration: @Sendable () -> Void
     ) -> Bool {
@@ -2913,13 +2909,13 @@ final class SoftwarePlaybackHost {
             videoDecoder.decode(packet: p, epoch: nil)
             return false
         } else if let aDec = audioDecoder, let aOut = audioOutput {
+            speechPackets?.append(p, replay: true)
             var enqueued = false
             for buf in aDec.decode(packet: p) {
                 // DEC-106 on the DVR path: `audioEpoch` was read before the ring read, so a rewind's flush
                 // retires what this packet decodes to. A pre-seek buffer kept at the head of the fresh queue
                 // carries a higher stamp than the new clock and mutes audio for the rewind distance.
                 guard aOut.enqueue(sampleBuffer: buf, ifEpoch: audioEpoch) else { return enqueued }
-                audioTapSink?(buf)   // #95: mirrored behind the accept
                 enqueued = true
             }
             return enqueued
@@ -2929,6 +2925,7 @@ final class SoftwarePlaybackHost {
 
     func stop() {
         stopRequested = true
+        pendingEndTail = nil
         pausedBeforeFirstFrame = false
         isPlaying = false
         isRebuffering = false
@@ -3007,6 +3004,7 @@ final class SoftwarePlaybackHost {
                                                pausedBeforeFirstFrame: self.pausedBeforeFirstFrame)
         }
         let ring = dvrRing
+        let speechHistory = speechPackets
         let vTbSec = videoTimeBaseSeconds
         let aTbSec = audioTimeBaseSeconds
         let liveSession = isLive
@@ -3047,10 +3045,6 @@ final class SoftwarePlaybackHost {
                                                 pausedBeforeFirstFrame: self.pausedBeforeFirstFrame)
         }
         let getStopRequested: @Sendable () -> Bool = { [weak self] in self?.stopRequested ?? true }
-        // #95: resolved per packet so a tap installed mid-session is picked up by running loops.
-        let getAudioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?) = { [weak self] in
-            self?.audioTapSink
-        }
         // #112 rework: same late-install resolution for the subtitle tap.
         let getSubtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { [weak self] in
             self?.subtitleTapSink
@@ -3192,6 +3186,7 @@ final class SoftwarePlaybackHost {
                     splitDisplaySetSubtitleStreamIndices: subSplitSetIndices,
                     subtitleTapSink: getSubtitleTapSink,
                     recordingTap: recordingTap,
+                    speechPackets: speechHistory,
                     playedMedia: playedMediaLedger
                 )
             }
@@ -3225,7 +3220,7 @@ final class SoftwarePlaybackHost {
                     clockArmed: getClockArmed,
                     markClockArmed: setClockArmed,
                     onEnd: onEnd,
-                    audioTapSink: getAudioTapSink,
+                    speechPackets: speechHistory,
                     noteDecodeGeneration: noteDecodeGeneration,
                     noteRebuffering: noteRebuffering,
                     noteLiveResumeCatchUp: noteLiveResumeCatchUp
@@ -3285,13 +3280,13 @@ final class SoftwarePlaybackHost {
                 backgroundAudioOnly: getBackgroundAudioOnly,
                 onError: onErrorForGeneration,
                 onEnd: onEndForGeneration,
-                audioTapSink: getAudioTapSink,
                 readGateBudget: readGateBudget,
                 subtitleStreamIndices: subIndices,
                 subtitleTimeBases: subTimeBases,
                 splitDisplaySetSubtitleStreamIndices: subSplitSetIndices,
                 subtitleTapSink: getSubtitleTapSink,
                 recordingTap: recordingTap,
+                speechPackets: speechHistory,
                 playedMedia: playedMediaLedger,
                 keyframeLedger: keyframeLedger,
                 noteRebuffering: noteRebuffering
@@ -3320,6 +3315,7 @@ final class SoftwarePlaybackHost {
         splitDisplaySetSubtitleStreamIndices: Set<Int32> = [],
         subtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { nil },
         recordingTap: @escaping @Sendable (UnsafeMutablePointer<AVPacket>) -> Void = { _ in },
+        speechPackets: AudioPacketWindow? = nil,
         playedMedia: PlayedMediaLedger? = nil
     ) {
         var timelineFold = LiveTimelineFold()
@@ -3359,6 +3355,7 @@ final class SoftwarePlaybackHost {
             }
             guard let packet else {
                 EngineLog.emit("[SWHost] live reader EOF (source lost)", category: .swPlayback)
+                speechPackets?.finish()
                 onSourceEnded()
                 return false
             }
@@ -3435,6 +3432,7 @@ final class SoftwarePlaybackHost {
 
             let isVideo = streamIdx == videoStreamIndex
             let isAudio = streamIdx == audioStreamIndex
+            if isAudio { speechPackets?.append(packet) }
             if isVideo || isAudio {
                 let tbSec = isVideo ? videoTimeBaseSeconds : audioTimeBaseSeconds
                 let rawPts = packet.pointee.pts
@@ -3506,7 +3504,7 @@ final class SoftwarePlaybackHost {
         clockArmed: @Sendable () -> Bool,
         markClockArmed: @Sendable () -> Void,
         onEnd: @Sendable () -> Void,
-        audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
+        speechPackets: AudioPacketWindow?,
         noteDecodeGeneration: @Sendable () -> Void,
         noteRebuffering: @Sendable (Bool) -> Void = { _ in },
         noteLiveResumeCatchUp: @Sendable (Double, UInt64) -> Void = { _, _ in }
@@ -3562,7 +3560,7 @@ final class SoftwarePlaybackHost {
                     audioStreamIndex: audioStreamIndex,
                     videoTimeBaseSeconds: videoTimeBaseSeconds,
                     audioTimeBaseSeconds: audioTimeBaseSeconds,
-                    audioTapSink: audioTapSink(),
+                    speechPackets: speechPackets,
                     audioEpoch: audioEpoch,
                     noteDecodeGeneration: noteDecodeGeneration
                 )
@@ -3897,7 +3895,7 @@ final class SoftwarePlaybackHost {
                 audioStreamIndex: audioStreamIndex,
                 videoTimeBaseSeconds: videoTimeBaseSeconds,
                 audioTimeBaseSeconds: audioTimeBaseSeconds,
-                audioTapSink: audioTapSink(),
+                speechPackets: speechPackets,
                 audioEpoch: audioEpoch,
                 noteDecodeGeneration: noteDecodeGeneration
             )
@@ -3985,13 +3983,13 @@ final class SoftwarePlaybackHost {
         backgroundAudioOnly: @Sendable () -> Bool,
         onError: @Sendable (String, UInt64) -> Void,
         onEnd: @Sendable (UInt64) -> Void,
-        audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
         readGateBudget: SoftwareReadGateBudget = .ordinary,
         subtitleStreamIndices: Set<Int32> = [],
         subtitleTimeBases: [Int32: AVRational] = [:],
         splitDisplaySetSubtitleStreamIndices: Set<Int32> = [],
         subtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { nil },
         recordingTap: @escaping @Sendable (UnsafeMutablePointer<AVPacket>) -> Void = { _ in },
+        speechPackets: AudioPacketWindow? = nil,
         playedMedia: PlayedMediaLedger? = nil,
         keyframeLedger: SWKeyframeLedger? = nil,
         noteRebuffering: @Sendable (Bool) -> Void = { _ in }
@@ -4469,6 +4467,7 @@ final class SoftwarePlaybackHost {
             }
             guard let packet else {
                 // Play the parked tail out before the flush: nothing more will arrive, the queues
+                speechPackets?.finish()
                 // must drain to end-of-media. The wait lifts a rebuffer hold on its own - held,
                 // the clock would never take the tail and end-of-media would never be reached.
                 // What the audio producer still holds (the APAC encoder's last packets) goes in
@@ -4537,6 +4536,7 @@ final class SoftwarePlaybackHost {
             }
 
             // AE#514: on the folded axis the clock runs on, which is what the sampler reads the playhead off.
+            if streamIdx == audioStreamIndex { speechPackets?.append(packet, replay: readAhead != nil) }
             if let playedMedia, streamIdx == videoStreamIndex || streamIdx == audioStreamIndex {
                 let tbSec = streamIdx == videoStreamIndex ? videoTimeBaseSeconds : audioTimeBaseSeconds
                 let ticks = packet.pointee.pts != Int64.min ? packet.pointee.pts : packet.pointee.dts
@@ -4777,7 +4777,6 @@ final class SoftwarePlaybackHost {
                 audioPacketsSeen += 1
                 let buffers = aDec.decode(packet: packet, epoch: audioFeedEpochBeforeRead)
                 if !buffers.isEmpty { audioBuffersProduced = true }
-                let tapSink = audioTapSink()
                 // The flush can also land inside `decode`, so the buffers are checked out again.
                 if seekGeneration() != genBeforeRead {
                     av_packet_unref(packet)
@@ -4790,11 +4789,6 @@ final class SoftwarePlaybackHost {
                         av_packet_free_safe(packet)
                         return true
                     }
-                }
-                // #95: mirrored behind the accept, so a refused buffer is not transcribed. The tap
-                // transcribes PCM, so a producer that hands the renderer compressed audio decodes it here.
-                if let tapSink {
-                    for buf in aDec.tapBuffers(for: packet, produced: buffers) { tapSink(buf) }
                 }
                 if let last = buffers.last {
                     let pts = CMSampleBufferGetPresentationTimeStamp(last)
@@ -4871,6 +4865,22 @@ final class SoftwarePlaybackHost {
         }
     }
 
+    private func publishPlayhead(_ raw: Double) {
+        guard raw.isFinite, raw >= 0 else { return }
+        vodPacketReadAhead?.updatePlayhead(raw)
+        directLiveReadAhead?.packets.updatePlayhead(raw)
+        sourceClockSeconds = raw
+        let zero: Double
+        if isLive {
+            liveEdgeLock.lock()
+            zero = sessionStartPts.isFinite ? sessionStartPts : 0
+            liveEdgeLock.unlock()
+        } else {
+            zero = max(0, clockSessionZero)
+        }
+        currentTime = max(0, raw - zero)
+    }
+
     private func startTimeUpdates() {
         timeTimer = Timer.publish(every: 0.25, on: .main, in: .common)
             .autoconnect()
@@ -4887,29 +4897,17 @@ final class SoftwarePlaybackHost {
                 // #254: a reposition in flight holds `currentTime` at its target; the synchronizer is
                 // still on the pre-seek anchor and would drag the published position backwards.
                 guard !self.seekInFlight, self.failure == nil else { return }
+                if self.pendingEndTail?.shouldFinish(clock: aOut.currentTimeSeconds, playing: self.isPlaying,
+                                                     now: ProcessInfo.processInfo.systemUptime) == true {
+                    self.publishEndOfMedia()
+                    return
+                }
                 let raw = aOut.currentTimeSeconds
                 self.emitDiagIfDue(clock: raw)
                 // AE#724: until the first sample arms it, the synchronizer still reads 0, and a paused
                 // resume would publish that over the anchor load() set.
                 if !self.isLive, !self.clockArmed { return }
-                if raw.isFinite, raw >= 0 {
-                    self.vodPacketReadAhead?.updatePlayhead(raw)
-                    self.directLiveReadAhead?.packets.updatePlayhead(raw)
-                    // Raw clock = source/subtitle axis; published alongside the mapped position (#107).
-                    self.sourceClockSeconds = raw
-                    // Live: subtract sessionStartPts to convert to "seconds since first frame"; VOD
-                    // subtracts the anchor's session zero (0 for zero-based sources, #107).
-                    if self.isLive {
-                        let start: Double = {
-                            self.liveEdgeLock.lock(); defer { self.liveEdgeLock.unlock() }
-                            return self.sessionStartPts.isFinite ? self.sessionStartPts : 0
-                        }()
-                        self.currentTime = max(0, raw - start)
-                    } else {
-                        let zero = self.clockSessionZero
-                        self.currentTime = zero > 0 ? max(0, raw - zero) : raw
-                    }
-                }
+                self.publishPlayhead(raw)
                 // Feed the live edge; publishLiveWindow in the engine reads currentTime for the playhead.
                 if self.isLive, let edge = self.liveEdgeSessionTime {
                     self.onLiveEdge?(edge)
