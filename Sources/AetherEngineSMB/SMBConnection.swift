@@ -1,7 +1,9 @@
 import Foundation
 import SMBClient
+import enum SMBClient.ErrorCode
+import struct SMBClient.ErrorResponse
 
-/// A read-only SMB2/3 byte source over one share + file path.
+/// A read-only SMB2 byte source over one share + file path.
 ///
 /// The transport is [kishikawakatsumi/SMBClient](https://github.com/kishikawakatsumi/SMBClient):
 /// a pure-Swift SMB2 client that speaks the wire protocol over `NWConnection`
@@ -44,8 +46,11 @@ public final class SMBConnection: ByteRangeSource, @unchecked Sendable {
         guard let host = server.host, !host.isEmpty else {
             throw SMBError(message: "no host in \(server.absoluteString)")
         }
-        let client = server.port.map { SMBClient(host: host, port: $0) }
-            ?? SMBClient(host: host)
+        let makeClient: () -> SMBClient = {
+            server.port.map { SMBClient(host: host, port: $0) }
+                ?? SMBClient(host: host)
+        }
+        var client = makeClient()
 
         // An empty username means "no explicit account": try guest first, then
         // fall back to a fully anonymous NTLM session if the server rejects it.
@@ -66,8 +71,24 @@ public final class SMBConnection: ByteRangeSource, @unchecked Sendable {
         do {
             do {
                 try await client.login(username: account ?? "guest", password: secret, domain: realm)
-            } catch where account == nil {
-                try await client.login(username: nil, password: nil)
+            } catch {
+                if Self.requiresSMB3(error) {
+                    throw SMBError(message: "该服务器仅允许 SMB 3，当前版本暂不支持，请在 NAS 上允许 SMB 2")
+                }
+                guard account == nil else { throw error }
+                // SVPlayer modification (2026-11-21): a rejected Guest
+                // setup may have consumed the connection's negotiate/session
+                // state. Retry anonymous authentication on a fresh session.
+                client.session.disconnect()
+                client = makeClient()
+                do {
+                    try await client.login(username: nil, password: nil)
+                } catch {
+                    if Self.requiresSMB3(error) {
+                        throw SMBError(message: "该服务器仅允许 SMB 3，当前版本暂不支持，请在 NAS 上允许 SMB 2")
+                    }
+                    throw SMBError(message: "服务器要求 SMB 签名或已禁用免密 Guest，请配置用户名和密码")
+                }
             }
 
             try await client.connectShare(share)
@@ -82,6 +103,17 @@ public final class SMBConnection: ByteRangeSource, @unchecked Sendable {
             client.session.disconnect()
             throw error
         }
+    }
+
+    // SVPlayer modification (2026-11-21): expose the same actionable
+    // SMB2-only message from the engine-side byte source.
+    private static func requiresSMB3(_ error: any Error) -> Bool {
+        guard let response = error as? ErrorResponse else { return false }
+        return [
+            ErrorCode.invalidSMB.rawValue,
+            ErrorCode.invalidParameter.rawValue,
+            ErrorCode.notSupported.rawValue,
+        ].contains(response.header.status)
     }
 
     public func read(at offset: Int64, length: Int) async throws -> Data {
