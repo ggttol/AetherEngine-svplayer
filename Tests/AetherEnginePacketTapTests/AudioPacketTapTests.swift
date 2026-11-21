@@ -62,7 +62,7 @@ final class AudioPacketTapTests: XCTestCase {
     }
 
     private func append(_ window: AudioPacketWindow, seconds: Double, index: Int32 = 0,
-                        offset: Int64 = 0, epoch: UInt64 = 1) throws {
+                        offset: Int64 = 0, epoch: UInt64 = 1, replay: Bool = false) throws {
         let packet = try XCTUnwrap(av_packet_alloc())
         var owned: UnsafeMutablePointer<AVPacket>? = packet
         defer { av_packet_free(&owned) }
@@ -72,7 +72,20 @@ final class AudioPacketTapTests: XCTestCase {
         packet.pointee.pts = Int64((seconds * 16_000).rounded())
         packet.pointee.dts = packet.pointee.pts
         packet.pointee.duration = 1_600
-        window.append(packet, offset: offset, epoch: epoch)
+        window.append(packet, offset: offset, epoch: epoch, replay: replay)
+    }
+
+    func testEvictedPacketCanReplayWithNonzeroOffset() throws {
+        try withStream { stream in
+            let window = AudioPacketWindow(deduplicatesReplay: true)
+            window.configure(stream: stream, epoch: 1)
+            try append(window, seconds: 1, offset: 16_000)
+            try append(window, seconds: 130, offset: 16_000)
+            try append(window, seconds: 1, offset: 16_000, replay: true)
+            let version = try XCTUnwrap(window.format?.version)
+            var cursor = AudioPacketWindow.Cursor()
+            XCTAssertEqual(window.next(cursor: &cursor, from: 1.9, through: 2.2, version: version)?.start, 2)
+        }
     }
 
     func testSeekRetiresProducerAndFindsEarlierPacketsBehindItsForwardTail() throws {
@@ -304,6 +317,79 @@ final class AudioPacketTapTests: XCTestCase {
             XCTAssertTrue(resumed.discontinuity)
             let next = try XCTUnwrap(try decode(at: origin + 2_912, bytes: 3_200).first)
             XCTAssertFalse(next.discontinuity)
+        }
+    }
+
+    // SVPlayer modification (2026-11-21): Regression tests for backward-seek head eviction (N-17)
+    // and condition-signaled paused AudioPacketTap wakeups (M-12).
+    func testBackwardSeekEvictsFarFutureHeadPacketsAndAllowsReplay() throws {
+        try withStream { stream in
+            let window = AudioPacketWindow(deduplicatesReplay: true)
+            window.configure(stream: stream, epoch: 1, sameSourceAcrossEpochs: true)
+            try append(window, seconds: 500, offset: 0, epoch: 1)
+            let version = try XCTUnwrap(window.format?.version)
+
+            // Backward seek to 10s on the same source (epoch 2): oldest packet at 500s (>120s ahead) must be evicted.
+            window.configure(stream: stream, epoch: 2, sameSourceAcrossEpochs: true)
+            try append(window, seconds: 10, offset: 0, epoch: 2)
+            var backCursor = AudioPacketWindow.Cursor()
+            XCTAssertEqual(window.next(cursor: &backCursor, from: 9.9, through: 10.5, version: version)?.start, 10)
+            XCTAssertNil(window.next(cursor: &backCursor, from: 499.9, through: 500.5, version: version))
+
+            // Forward seek back to 500s (epoch 3): evicted 500s packet can be replayed cleanly.
+            window.configure(stream: stream, epoch: 3, sameSourceAcrossEpochs: true)
+            try append(window, seconds: 500, offset: 0, epoch: 3, replay: true)
+            var forwardCursor = AudioPacketWindow.Cursor()
+            XCTAssertEqual(window.next(cursor: &forwardCursor, from: 499.9, through: 500.5, version: version)?.start, 500)
+        }
+    }
+
+    func testPausedTapSleepsOnWakeSignalAndWakesImmediatelyOnPlayheadAdvanceOrStop() throws {
+        try withStream { stream in
+            let packets = AudioPacketWindow(deduplicatesReplay: true)
+            packets.configure(stream: stream, epoch: 1, sameSourceAcrossEpochs: true)
+            for tenth in 0..<700 {
+                try append(packets, seconds: Double(tenth) * 0.1, epoch: 1)
+            }
+            let head = AtomicDouble(0)
+            let deliveredEnd = AtomicDouble(0)
+            let tap = AudioPacketTap(
+                packets: packets,
+                channels: .downmix,
+                start: 0,
+                playhead: head,
+                source: nil,
+                yield: { buffer in
+                    deliveredEnd.set(buffer.sourceTime + Double(buffer.buffer.frameLength) / buffer.buffer.format.sampleRate)
+                },
+                finish: {}
+            )
+            tap.begin()
+            defer { tap.stop() }
+
+            let fillDeadline = ProcessInfo.processInfo.systemUptime + 3.0
+            while deliveredEnd.get() < 44.8 && ProcessInfo.processInfo.systemUptime < fillDeadline {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            XCTAssertGreaterThanOrEqual(deliveredEnd.get(), 44.8)
+
+            // Let worker park on AudioTapWakeSignal (which sleeps up to 2.0s unless signaled).
+            Thread.sleep(forTimeInterval: 0.05)
+
+            let wakeStart = ProcessInfo.processInfo.systemUptime
+            head.set(15.0)
+            while deliveredEnd.get() < 59.5 && ProcessInfo.processInfo.systemUptime - wakeStart < 1.5 {
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+            let wakeElapsed = ProcessInfo.processInfo.systemUptime - wakeStart
+            XCTAssertGreaterThanOrEqual(deliveredEnd.get(), 59.5)
+            XCTAssertLessThan(wakeElapsed, 0.5, "Playhead change must wake paused tap without waiting out idle sleep")
+
+            Thread.sleep(forTimeInterval: 0.05)
+            let stopStart = ProcessInfo.processInfo.systemUptime
+            tap.stop()
+            let stopElapsed = ProcessInfo.processInfo.systemUptime - stopStart
+            XCTAssertLessThan(stopElapsed, 0.25, "stop() must wake parked AudioPacketTap worker immediately")
         }
     }
 }

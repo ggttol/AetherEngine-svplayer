@@ -1,3 +1,4 @@
+// SVPlayer modification (2026-11-21): Support optional change wakeup callbacks on AtomicDouble for AudioPacketTap.
 import Foundation
 
 // Decision helpers for the loopback-HLS VOD scrub-burst livelock (issue #65). Both are pure so the
@@ -219,9 +220,21 @@ final class SeekResumeGuard {
 final class AtomicDouble: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Double
+    // SVPlayer modification (2026-11-21): Optional observer invoked outside the lock when the value changes.
+    private var onChange: (@Sendable () -> Void)?
     init(_ initial: Double) { value = initial }
     func get() -> Double { lock.lock(); defer { lock.unlock() }; return value }
-    func set(_ newValue: Double) { lock.lock(); value = newValue; lock.unlock() }
+    func set(_ newValue: Double) {
+        let notify: (@Sendable () -> Void)? = lock.withLock {
+            let changed = value != newValue
+            value = newValue
+            return changed ? onChange : nil
+        }
+        notify?()
+    }
+    func setOnChange(_ handler: (@Sendable () -> Void)?) {
+        lock.withLock { onChange = handler }
+    }
 }
 
 /// Thread-safe Double? mirror so the off-main wedge re-anchor can read the engine's pending recovery

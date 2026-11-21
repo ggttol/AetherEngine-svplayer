@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import CoreMedia
 import Foundation
 import AetherLibavformat

@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 import Combine
 
@@ -33,11 +34,12 @@ extension AetherEngine {
         let playhead = AtomicDouble(start)
         let stream = controller.makeStream { onStop in
             guard let history, history.format != nil, start.isFinite, let yield = controller.makeYield() else { return }
+            let landingDeadline = ContinuousClock.now + .seconds(4)
             var awaitingLandingClock = true
             let selection = clock.$sourceTime.dropFirst().sink { sourceTime in
                 guard sourceTime.isFinite else { return }
                 if awaitingLandingClock {
-                    guard abs(sourceTime - start) <= 4 else { return }
+                    guard abs(sourceTime - start) <= 4 || ContinuousClock.now >= landingDeadline else { return }
                     awaitingLandingClock = false
                 }
                 playhead.set(sourceTime)
@@ -46,10 +48,15 @@ extension AetherEngine {
                                      source: audioLookaheadSource(), yield: yield) { [weak controller] in
                 Task { @MainActor in controller?.finishInput() }
             }
+            // SVPlayer modification (2026-11-21): Wake the tap worker immediately on transport state changes.
+            let stateWake = $state.dropFirst().sink { _ in
+                tap.notifyWake()
+            }
             controller.readProgress = { tap.progress }
             tap.begin()
             onStop {
                 selection.cancel()
+                stateWake.cancel()
                 tap.stop()
             }
         }

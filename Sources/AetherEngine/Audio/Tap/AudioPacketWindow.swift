@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 import AetherLibavcodec
 import AetherLibavformat
@@ -76,9 +77,23 @@ final class AudioPacketWindow: @unchecked Sendable {
     private var offsetTicks: Int64 = 0
     private let deduplicatesReplay: Bool
     private var resident: [Identity: Int] = [:]
+    // SVPlayer modification (2026-11-21): Wake listeners registered by AudioPacketTap so paused
+    // or starved tap workers sleep on a condition instead of polling at 25 Hz.
+    private var mutationListeners: [UUID: @Sendable () -> Void] = [:]
 
     init(deduplicatesReplay: Bool = false) {
         self.deduplicatesReplay = deduplicatesReplay
+    }
+
+    @discardableResult
+    func addMutationObserver(_ observer: @escaping @Sendable () -> Void) -> UUID {
+        let id = UUID()
+        lock.withLock { mutationListeners[id] = observer }
+        return id
+    }
+
+    func removeMutationObserver(_ id: UUID) {
+        _ = lock.withLock { mutationListeners.removeValue(forKey: id) }
     }
 
     var format: Format? { lock.withLock { configuration } }
@@ -90,8 +105,9 @@ final class AudioPacketWindow: @unchecked Sendable {
               let owned = HLSVideoEngine.OwnedCodecParameters(copying: parameters) else { return }
         let timeBase = stream.pointee.time_base
         guard timeBase.num > 0, timeBase.den > 0 else { return }
-        lock.withLock {
-            guard epoch >= self.epoch else { return }
+        // SVPlayer modification (2026-11-21): Snapshot tap mutation observers under lock for epoch transitions.
+        let listeners: [@Sendable () -> Void] = lock.withLock {
+            guard epoch >= self.epoch else { return [] }
             let newEpoch = epoch != self.epoch
             if newEpoch {
                 previousEnd = nil
@@ -102,11 +118,16 @@ final class AudioPacketWindow: @unchecked Sendable {
             self.epoch = epoch
             if (!newEpoch || sameSourceAcrossEpochs), let format = configuration, stream.pointee.index == format.streamIndex,
                format.timeBase.num == timeBase.num, format.timeBase.den == timeBase.den,
-               Self.sameCodec(owned.ptr, format.parameters.ptr) { return }
+               Self.sameCodec(owned.ptr, format.parameters.ptr) {
+                return newEpoch ? Array(mutationListeners.values) : []
+            }
             clear()
             configuration = Format(parameters: owned, timeBase: timeBase, streamIndex: stream.pointee.index,
                                    version: (configuration?.version ?? 0) &+ 1)
+            return Array(mutationListeners.values)
         }
+        // SVPlayer modification (2026-11-21): Signal tap observers outside the window lock on epoch/format change.
+        for notify in listeners { notify() }
     }
 
     private static func sameCodec(_ lhs: UnsafePointer<AVCodecParameters>,
@@ -122,22 +143,24 @@ final class AudioPacketWindow: @unchecked Sendable {
 
     func append(_ source: UnsafeMutablePointer<AVPacket>, offset: Int64 = 0, epoch: UInt64 = 0,
                 replay: Bool = false) {
-        lock.withLock {
+        let listeners: [@Sendable () -> Void] = lock.withLock {
             guard epoch == self.epoch, let format = configuration,
-                  source.pointee.stream_index == format.streamIndex else { return }
-            let identity = deduplicatesReplay ? Identity(source) : nil
-            if replay, let identity, resident[identity] != nil { return }
+                  source.pointee.stream_index == format.streamIndex else { return [] }
             guard let packet = Packet(copying: source, timeBase: format.timeBase, offset: offset,
                                       previousEnd: previousEnd), packet.start.isFinite,
-                  packet.byteCount <= byteLimit else { return }
+                  packet.byteCount <= byteLimit else { return [] }
+            let identity = deduplicatesReplay ? Identity(packet.pointer) : nil
+            if replay, let identity, resident[identity] != nil { return [] }
             previousEnd = packet.end
             lastPacketStart = packet.start
             ended = false
             offsetTicks = offset
             if slots.isEmpty { slots = Array(repeating: nil, count: capacity) }
+            // SVPlayer modification (2026-11-21): Also evict far-future head packets left behind after
+            // a same-source backward seek so they cannot block the 120 s sliding window.
             while firstID < nextID, let oldest = slots[firstID % capacity],
                   nextID - firstID >= capacity || bytes + packet.byteCount > byteLimit
-                    || packet.start - oldest.end > 120 {
+                    || packet.start - oldest.end > 120 || oldest.start - packet.end > 120 {
                 bytes -= oldest.byteCount
                 if deduplicatesReplay, let key = Identity(oldest.pointer), let count = resident[key] {
                     if count > 1 { resident[key] = count - 1 } else { resident.removeValue(forKey: key) }
@@ -149,7 +172,10 @@ final class AudioPacketWindow: @unchecked Sendable {
             nextID += 1
             bytes += packet.byteCount
             if let identity { resident[identity, default: 0] += 1 }
+            return Array(mutationListeners.values)
         }
+        // SVPlayer modification (2026-11-21): Notify AudioPacketTap wake listeners outside the window lock.
+        for notify in listeners { notify() }
     }
 
     struct Cursor {
@@ -159,11 +185,22 @@ final class AudioPacketWindow: @unchecked Sendable {
     }
 
     func finish(epoch: UInt64 = 0) {
-        lock.withLock { if self.epoch == epoch { ended = true } }
+        let listeners: [@Sendable () -> Void] = lock.withLock {
+            guard self.epoch == epoch, !ended else { return [] }
+            ended = true
+            return Array(mutationListeners.values)
+        }
+        // SVPlayer modification (2026-11-21): Wake waiting tap consumers immediately on stream/playback EOF.
+        for notify in listeners { notify() }
     }
 
     func setPlaybackEnded(_ value: Bool) {
-        lock.withLock { playbackEnded = value }
+        let listeners: [@Sendable () -> Void] = lock.withLock {
+            let changed = playbackEnded != value
+            playbackEnded = value
+            return changed ? Array(mutationListeners.values) : []
+        }
+        for notify in listeners { notify() }
     }
 
     func hasEnded(at sourceTime: Double) -> Bool {

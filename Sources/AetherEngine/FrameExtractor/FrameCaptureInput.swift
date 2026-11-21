@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 import AetherLibavformat
 
@@ -77,9 +78,10 @@ import AetherLibavformat
             default: return -1
             }
             let (next, overflow) = origin.addingReportingOverflow(offset)
+            let (absolute, absoluteOverflow) = base.addingReportingOverflow(next)
             if !source.isSeekable, next != position { return -1 }
-            guard !overflow, next >= 0, (length < 0 || next <= length),
-                  source.seek(offset: base + next, whence: SEEK_SET) == base + next else { return -1 }
+            guard !overflow, !absoluteOverflow, next >= 0, (length < 0 || next <= length),
+                  source.seek(offset: absolute, whence: SEEK_SET) == absolute else { return -1 }
             position = next
             return next
         }

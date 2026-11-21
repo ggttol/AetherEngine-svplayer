@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 import Darwin.Mach
 import QuartzCore
@@ -8,6 +9,10 @@ import Combine
 import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
+// SVPlayer modification (2026-11-21): Import CoreAudio on macOS for AirPlay output route detection.
+#if os(macOS)
+import CoreAudio
+#endif
 
 #if canImport(UIKit)
 import UIKit
@@ -1379,17 +1384,27 @@ public final class AetherEngine: ObservableObject {
     var userPauseCount = 0
 
     /// Wedge-safe keepalive decision: keep the video pipeline alive on background ONLY while the app stays
-    /// genuinely running (PiP active, or actively playing for background audio), never across an idle
-    /// suspension. Pure so the policy is unit-tested without the lifecycle. See setupLifecycleObservers.
-    nonisolated static func shouldKeepVideoAlive(enabled: Bool, pipActive: Bool, state: PlaybackState) -> Bool {
-        enabled && (pipActive || state == .playing)
+    /// genuinely running (PiP active, external playback / AirPlay active, or actively playing for background
+    /// audio), never across an idle suspension. Pure so the policy is unit-tested without the lifecycle.
+    // SVPlayer modification (2026-11-21): Exempt active PiP and wireless AirPlay / external playback from
+    // background video teardown even when general background audio playback (enabled) is false.
+    nonisolated static func shouldKeepVideoAlive(
+        enabled: Bool,
+        pipActive: Bool,
+        externalPlaybackActive: Bool = false,
+        state: PlaybackState
+    ) -> Bool {
+        if pipActive { return true }
+        if externalPlaybackActive { return state == .playing || state == .paused }
+        return enabled && state == .playing
     }
 
     /// tvOS keepalive: ONLY an active PiP window keeps the app genuinely running in the background (there
     /// is no tvOS background-audio case for video sessions); everything else keeps the wedge-safe
     /// unconditional teardown that protects mediaserverd across multi-hour suspensions.
+    // SVPlayer modification (2026-11-21): Keep an active tvOS PiP window alive regardless of background audio toggle.
     nonisolated static func shouldKeepVideoAliveTV(enabled: Bool, pipActive: Bool) -> Bool {
-        enabled && pipActive
+        pipActive || (enabled && pipActive)
     }
 
     /// AE#158: a system PiP window closes the moment its source layer's player drops its item (the #93
@@ -4561,17 +4576,24 @@ public final class AetherEngine: ObservableObject {
     private let lifecycleObservers = LifecycleObserverBag()
     /// For lifecycle observers installed from extension files.
     func retainLifecycleObserver(_ observer: NSObjectProtocol) { lifecycleObservers.append(observer) }
+    // SVPlayer modification (2026-11-21): Retain non-NotificationCenter RAII route listeners across engine lifetime.
+    func retainAuxiliaryObserver(_ observer: AnyObject) { lifecycleObservers.appendAuxiliary(observer) }
 
     private final class LifecycleObserverBag: @unchecked Sendable {
         private let lock = NSLock()
         private var tokens: [Any] = []
+        private var auxiliary: [AnyObject] = []
         func append(_ token: Any) {
             lock.lock(); tokens.append(token); lock.unlock()
+        }
+        func appendAuxiliary(_ object: AnyObject) {
+            lock.lock(); auxiliary.append(object); lock.unlock()
         }
         deinit {
             for token in tokens {
                 NotificationCenter.default.removeObserver(token)
             }
+            auxiliary.removeAll()
         }
     }
 
@@ -6114,7 +6136,17 @@ public final class AetherEngine: ObservableObject {
         // receiver showing video got the sound alone. When the interlace rule is the only reason for the
         // software route and the host says the receiver shows video, a picture there wins over
         // deinterlacing here: the native route hands the receiver the stream.
+        // SVPlayer modification (2026-11-21): Skip the software deinterlace detour when the host explicitly turned deinterlacing off.
+        if options.deinterlaceMode == .off, useSoftwarePath, !multiviewCarriage,
+           VideoRoutingPolicy.routesSoftwareForDeclaredInterlace(
+               codecID: detectedCodecID,
+               fieldOrder: detectedFieldOrder,
+               spsIndicatesInterlaced: spsIndicatesInterlaced) {
+            useSoftwarePath = false
+            requiresDeinterlaceWarmup = false
+        }
         let declaredInterlaceRoutesSoftware = useSoftwarePath && !multiviewCarriage
+            && options.deinterlaceMode != .off
             && VideoRoutingPolicy.routesSoftwareForDeclaredInterlace(
                 codecID: detectedCodecID,
                 fieldOrder: detectedFieldOrder,
@@ -6775,7 +6807,9 @@ public final class AetherEngine: ObservableObject {
 
     /// Tear down and reload from the current position. Call after background return; tvOS invalidates
     /// AVIO connections and VT sessions on suspension.
-    public func reloadAtCurrentPosition() async throws {
+    // SVPlayer modification (2026-11-21): Accept explicit foreground-restore autoplay intent, clear stale
+    // backgrounded state before reloading, and roll back backgroundTeardownSelection if reload fails.
+    public func reloadAtCurrentPosition(autoplay: Bool? = nil) async throws {
         // AE#560: a reload re-opens the source, which can come back with different codecs or a
         // different program, so the recording ends as a source reset rather than as a session end.
         // stopInternal's own call further down is then a no-op.
@@ -6784,13 +6818,16 @@ public final class AetherEngine: ObservableObject {
         // that path the live state every snapshot below reads is wiped long before this call. When
         // nothing was parked this is exactly the pre-#357 live read.
         let resumesTornDownSession = backgroundTeardownSelection != nil
+        if resumesTornDownSession {
+            noteForegroundActive()
+        }
         let selection = consumeReloadSelection()
         // AE#464 round 2: come back in the transport state the session is IN, not the one its first
         // mount was given. Written before the branch because only the URL branch below carries a
         // struct into `load`; the custom-source branch reads `loadedOptions` field by field.
-        // A torn-down session (#357 background teardown) has no transport left to read and its
-        // resume is the host's call, so that path keeps replaying the mount flag exactly as before.
-        if !resumesTornDownSession { setLoadedAutoplay(sessionRebuildResumesPlaying) }
+        // SVPlayer modification (2026-11-21): Explicit caller autoplay overrides stale mount autoplay
+        // so paused or app-locked sessions never briefly play audio during foreground reload.
+        setLoadedAutoplay(autoplay ?? sessionRebuildResumesPlaying)
         if isCustomSource {
             // Rebuild on retained reader (seekable only); no URL to reopen.
             //
@@ -6803,6 +6840,11 @@ public final class AetherEngine: ObservableObject {
             guard customSourceIsSeekable, let placeholderURL = loadedURL else {
                 let refusal: SessionReloadRefusal =
                     loadedURL == nil ? .noActiveSession : .customSourceNotSeekable
+                // SVPlayer modification (2026-11-21): Preserve parked restore selection when custom-source reload is refused.
+                if resumesTornDownSession, loadedURL != nil {
+                    restoreReloadSelection(selection)
+                    state = .paused
+                }
                 EngineLog.emit(
                     "[AetherEngine] #526 reload at current position refused: \(refusal). A session "
                     + "on a forward-only custom source has no position to reopen at; a live host's "
@@ -6829,8 +6871,20 @@ public final class AetherEngine: ObservableObject {
             // its load threw; both branches now answer the same way. Measured on a live custom
             // source whose reader read `cancel()` as terminal: the rebuild failed on stream info
             // and the call still returned success.
-            if let failure { throw failure }
-            if loadGeneration != reloadGeneration { throw CancellationError() }
+            // SVPlayer modification (2026-11-21): Roll back restore selection on custom-source rebuild failure or cancellation.
+            if let failure {
+                if resumesTornDownSession, loadedURL != nil {
+                    restoreReloadSelection(selection)
+                    state = .paused
+                }
+                throw failure
+            }
+            if loadGeneration != reloadGeneration {
+                if resumesTornDownSession, loadedURL != nil, backgroundTeardownSelection == nil, playbackBackend == .none {
+                    restoreReloadSelection(selection)
+                }
+                throw CancellationError()
+            }
             // The reload restores from its own pre-stopInternal snapshot, which a torn-down session
             // no longer had anything in; replay the parked subtitle pick on top of it.
             if resumesTornDownSession {
@@ -6872,8 +6926,20 @@ public final class AetherEngine: ObservableObject {
         var options = loadedOptions
         options.isLiveRejoin = options.isLive
         options.subtitleSessionCarryover = carryover
-        try await load(url: url, startPosition: resume, options: options,
-                       audioSourceStreamIndex: audioToRestore.map { Int32($0) }, discTitleID: titleID)
+        do {
+            try await load(url: url, startPosition: resume, options: options,
+                           audioSourceStreamIndex: audioToRestore.map { Int32($0) }, discTitleID: titleID)
+        } catch {
+            // SVPlayer modification (2026-11-21): Keep needsForegroundVideoRestore armed and park at .paused
+            // when a foreground restore fails so a subsequent play() retries reloadAtCurrentPosition().
+            if resumesTornDownSession, loadedURL != nil {
+                restoreReloadSelection(selection)
+                if !(error is CancellationError) {
+                    state = .paused
+                }
+            }
+            throw error
+        }
         // AE#711 follow-up: `load` autostarts from the flag it was handed; a play/pause that arrived
         // while it ran is the newer word.
         if let intent = transportIntentUnderReconstruction, intent != options.autoplay {
@@ -8086,11 +8152,42 @@ public final class AetherEngine: ObservableObject {
     /// receiver's output format to HDR gets the offer again on the next launch.
     private var airPlayReceiversRefusingHDRMaster: Set<String> = []
 
+    #if os(macOS)
+    // SVPlayer modification (2026-11-21): Query CoreAudio default output transport type on macOS so
+    // AirPlay speaker/TV routes are recognized without AVAudioSession.
+    nonisolated private static func macOSAirPlayOutputDeviceID() -> UInt32? {
+        var defaultAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioDeviceID(0)
+        var deviceSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &defaultAddress, 0, nil, &deviceSize, &deviceID
+        ) == noErr, deviceID != kAudioObjectUnknown else { return nil }
+        var transportAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var transport: UInt32 = 0
+        var transportSize = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(
+            deviceID, &transportAddress, 0, nil, &transportSize, &transport
+        ) == noErr, transport == kAudioDeviceTransportTypeAirPlay else { return nil }
+        return deviceID
+    }
+    #endif
+
     /// Route UID of the wireless AirPlay receiver currently holding the audio route, or nil.
     nonisolated static func currentAirPlayReceiverUID() -> String? {
+        // SVPlayer modification (2026-11-21): Include macOS CoreAudio AirPlay output device identity.
         #if os(iOS)
         return AVAudioSession.sharedInstance().currentRoute.outputs
             .first { $0.portType == .airPlay }?.uid
+        #elseif os(macOS)
+        return macOSAirPlayOutputDeviceID().map { "coreaudio-airplay-\($0)" }
         #else
         return nil
         #endif
@@ -8297,6 +8394,22 @@ public final class AetherEngine: ObservableObject {
         guard externalPlaybackEdgeHeld else { return }
         externalPlaybackEdgeHeld = false
         let active = externalPlaybackHoldsThePicture
+        // SVPlayer modification (2026-11-21): On macOS per-AVPlayer AirPlay routing (AVRoutePickerView),
+        // CoreAudio's system output stays local while the rebuilt AVPlayerItem takes ~50-150 ms to re-engage
+        // external playback. Give it a brief settle window before declaring AirPlay ended.
+        #if os(macOS)
+        if airPlayActive && !active {
+            let gen = loadGeneration
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let self, self.loadGeneration == gen, !self.sessionPreservingReloadInFlight else { return }
+                let settled = self.externalPlaybackHoldsThePicture
+                EngineLog.emit("[AirPlay] reconciling macOS held edge after settle: active=\(settled)", category: .engine)
+                self.handleExternalPlaybackChange(active: settled)
+            }
+            return
+        }
+        #endif
         EngineLog.emit("[AirPlay] reconciling the held edge after the reload: active=\(active) "
                        + "(player=\(isExternalPlaybackActiveNow) "
                        + "route=\(Self.isWirelessAirPlayRoute()))", category: .engine)
@@ -8307,8 +8420,11 @@ public final class AetherEngine: ObservableObject {
     /// `AVPlayer.isExternalPlaybackActive` this survives an item teardown, which is what makes it the right
     /// signal for the post-reload reconcile (#227). Wired HDMI reports `.HDMI` and is excluded by construction.
     nonisolated static func isWirelessAirPlayRoute() -> Bool {
+        // SVPlayer modification (2026-11-21): Detect wireless AirPlay audio routes on macOS as well as iOS.
         #if os(iOS)
         return AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .airPlay }
+        #elseif os(macOS)
+        return macOSAirPlayOutputDeviceID() != nil
         #else
         return false
         #endif
@@ -8330,13 +8446,14 @@ public final class AetherEngine: ObservableObject {
     }
 
     /// Playback URL and subtitle-rendition reality for a freshly started loopback session, after the AirPlay
-    /// rewrite (#86, #227). Identity outside iOS and whenever external playback is off; when the LAN IP scan
+    /// rewrite (#86, #227). Identity outside iOS/macOS and whenever external playback is off; when the LAN IP scan
     /// comes up empty the loopback URL stays as resolved (the receiver then simply cannot reach it, unchanged
     /// from #86). `subtitleRenditionsServed` is what the served playlist actually carries, which is what
     /// `nativeSubtitleRenditionsServed` promises hosts.
     func airPlayAdjustedPlayback(url: URL, session: HLSVideoEngine) -> (url: URL, subtitleRenditionsServed: Bool) {
         airPlayServedMasterToReceiver = false
-        #if os(iOS)
+        // SVPlayer modification (2026-11-21): Rewrite loopback 127.0.0.1 URLs to LAN IP on macOS AirPlay as well as iOS.
+        #if os(iOS) || os(macOS)
         guard airPlayActive else { return (url, session.servingMasterPlaylist) }
         let receiverUID = Self.currentAirPlayReceiverUID()
         let refusedBefore = receiverUID.map { airPlayReceiversRefusingHDRMaster.contains($0) } ?? false

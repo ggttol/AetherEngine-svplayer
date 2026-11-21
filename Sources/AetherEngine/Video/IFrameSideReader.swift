@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 // Sources/AetherEngine/Video/IFrameSideReader.swift
 import Foundation
 import CoreGraphics
@@ -170,7 +171,9 @@ final class IFrameSideReader: @unchecked Sendable {
             defer { decoder.close() }
             var actual: Double?
             let size = CGSize(width: maxWidth, height: maxWidth)
-            let image = decoder.decodeFrame(at: seconds, mode: .snapshot, targetWidth: maxWidth, maxSize: size,
+            // SVPlayer modification (2026-11-21): Downscale scrub refinements via .preview instead of full .snapshot bicubic.
+            let mode: FrameMode = maxWidth <= 640 ? .preview : .snapshot
+            let image = decoder.decodeFrame(at: seconds, mode: mode, targetWidth: maxWidth, maxSize: size,
                                             isCancelled: { token.isCancelled || control.isStopped },
                                             residentDeadline: .now + .seconds(2), reportDecodedTime: { actual = $0 },
                                             bounded: true)

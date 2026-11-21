@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 import AetherLibavcodec
 import AetherLibavformat
@@ -29,6 +30,7 @@ final class AudioPacketLookahead: @unchecked Sendable {
     private var demuxer: Demuxer?
     private var openingCustomReader: IOReader?
     private var terminal = false
+    private var retryAfter = ContinuousClock.now
     private var phase = "idle"
 
     var status: String { lock.withLock { phase } }
@@ -42,7 +44,7 @@ final class AudioPacketLookahead: @unchecked Sendable {
     func request(from sourceTime: Double, through target: Double) {
         lock.lock()
         defer { lock.unlock() }
-        guard !stopped, !terminal else { return }
+        guard !stopped, !terminal, ContinuousClock.now >= retryAfter else { return }
         requestedStart = max(requestedStart, sourceTime)
         requestedEnd = max(requestedEnd, target)
         lock.signal()
@@ -78,7 +80,9 @@ final class AudioPacketLookahead: @unchecked Sendable {
             ownedReader?.close()
             lock.lock()
             demuxer = nil
-            terminal = true
+            running = false
+            terminal = outcome == "eof" || outcome == "unavailable"
+            retryAfter = .now + .seconds(3)
             phase = stopped ? "stopped" : outcome
             lock.unlock()
         }
@@ -138,7 +142,7 @@ final class AudioPacketLookahead: @unchecked Sendable {
                     validateLanding = demand
                 }
                 if validateLanding != nil, !landingBudgetArmed {
-                    demux.beginInputByteBudget(8 * 1024 * 1024)
+                    demux.beginInputByteBudget(32 * 1024 * 1024)
                     demux.beginReadDeadline(secondsFromNow: 3)
                     landingBudgetArmed = true
                 }

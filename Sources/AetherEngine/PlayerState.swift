@@ -1,3 +1,4 @@
+// SVPlayer modification (2026-11-21): Add DeinterlaceMode.off for host picture preferences.
 import Foundation
 import CoreGraphics
 
@@ -348,6 +349,8 @@ public struct DisplayCapabilities: Sendable, Equatable {
 /// interlaced H.264, which routes software because AVPlayer does not deinterlace, #107 /
 /// `VideoRoutingPolicy`).
 public enum DeinterlaceMode: String, Sendable, Equatable {
+    // SVPlayer modification (2026-11-21): Allow host preferences to disable deinterlacing explicitly.
+    case off
     /// yadif_videotoolbox (Metal compute over VideoToolbox frames) when the linked FFmpeg build
     /// ships it AND a Metal device exists at runtime; otherwise falls back to software bwdif.
     /// The hardware path also skips the sws_scale copy: the filter sink emits IOSurface-backed

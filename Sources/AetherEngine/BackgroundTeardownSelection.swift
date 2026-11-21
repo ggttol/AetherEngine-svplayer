@@ -1,3 +1,4 @@
+// SVPlayer modification (2026-11-21): Preserve parked teardown selection when foreground reload fails.
 import Foundation
 
 /// AetherEngine#357: the session selection a teardown hands to the reload that follows it.
@@ -35,6 +36,12 @@ extension AetherEngine {
         let parked = backgroundTeardownSelection
         backgroundTeardownSelection = nil
         return liveSelection(over: parked)
+    }
+
+    // SVPlayer modification (2026-11-21): Roll back the parked selection when a foreground reload
+    // fails before establishing a replacement session so needsForegroundVideoRestore stays armed.
+    func restoreReloadSelection(_ selection: BackgroundTeardownSelection) {
+        backgroundTeardownSelection = selection
     }
 
     private func liveSelection(over parked: BackgroundTeardownSelection?) -> BackgroundTeardownSelection {

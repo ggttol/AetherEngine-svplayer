@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 import CoreGraphics
 
@@ -194,12 +195,33 @@ extension AetherEngine {
             return still?.shifted(by: shift)
         }
         guard url.isFileURL, let host = softwareHost, let extractor = makeFrameExtractor() else { return nil }
+        // SVPlayer modification (2026-11-21): Enforce scrubDecoderPixelBudget and downscale 4K scrub
+        // refinement via .preview mode with bounded packet/time budgets instead of full 4K snapshots.
+        let codedPixels = max(0, Int(sourceVideoWidth)) * max(0, Int(sourceVideoHeight))
+        let isUltraHD = codedPixels > 1920 * 1088
+        let boundedWidth = min(maxWidth, isUltraHD ? 240 : 320)
         let origin = host.sourceSeconds(forSession: 0)
-        let limit = ProbeLimits(maxInputBytes: 8 * 1024 * 1024, maxPackets: 900,
-                                maxPacketBytes: 4 * 1024 * 1024, timeBudget: 2)
-        let size = CGSize(width: CGFloat(maxWidth), height: CGFloat(maxWidth))
-        let still = await extractor.boundedSnapshot(at: seconds + origin, maxSize: size,
-                                                    limits: limit, cancellation: cancellation)
+        let limit = ProbeLimits(
+            maxInputBytes: isUltraHD ? 6 * 1024 * 1024 : 8 * 1024 * 1024,
+            maxPackets: isUltraHD ? 240 : 900,
+            maxPacketBytes: 4 * 1024 * 1024,
+            timeBudget: isUltraHD ? 0.75 : 2
+        )
+        let size = CGSize(width: CGFloat(boundedWidth), height: CGFloat(boundedWidth))
+        let gen = loadGeneration
+        let still = await decodeScrubStill(
+            on: extractor,
+            generation: gen,
+            stillWanted: { !Task.isCancelled && !cancellation.isCancelled }
+        ) {
+            await extractor.boundedSnapshot(
+                at: seconds + origin,
+                maxSize: size,
+                limits: limit,
+                cancellation: cancellation,
+                mode: .preview
+            )
+        }
         await extractor.shutdown()
         guard let still, let actual = still.actualSeconds, actual.isFinite,
               abs(actual - origin - seconds) < 2 else { return nil }

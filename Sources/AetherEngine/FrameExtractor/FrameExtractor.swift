@@ -1,3 +1,4 @@
+// SVPlayer modification (2026-11-21): Support downscaled .preview mode in boundedSnapshot for 4K scrub refinement.
 import Foundation
 import CoreGraphics
 
@@ -272,8 +273,10 @@ public actor FrameExtractor {
     /// analysis, seek and decode. The controlled reader counts every input byte,
     /// the monotonic deadline interrupts I/O, and a late result is discarded.
     /// Unlike snapshot(), this never uses a previously opened or cached context.
+    // SVPlayer modification (2026-11-21): Allow callers to request downscaled .preview mode in boundedSnapshot.
     public func boundedSnapshot(at seconds: Double, maxSize: CGSize,
-                                limits: ProbeLimits, cancellation: ProbeCancellation) async -> BoundedStillFrame? {
+                                limits: ProbeLimits, cancellation: ProbeCancellation,
+                                mode: FrameMode = .snapshot) async -> BoundedStillFrame? {
         guard !isShutDown, seconds.isFinite, !Task.isCancelled, !cancellation.isCancelled,
               let control = try? ProbeControl(limits: limits, cancellation: cancellation) else { return nil }
         currentToken?.cancel()
@@ -281,6 +284,9 @@ public actor FrameExtractor {
         boundedCancellation = cancellation
         let token = CancelToken(); currentToken = token
         let context = self.context
+        // SVPlayer modification (2026-11-21): Honour .preview targetWidth so 4K scrub refinement
+        // avoids full-frame bicubic/loop-filter passes and oversized intermediate buffers.
+        let targetWidth = mode.usesTargetWidth ? max(1, Int(maxSize.width.rounded(.down))) : 0
         let result = await withTaskCancellationHandler {
             await runOnQueue { () -> BoundedStillFrame? in
                 // A previously opened demuxer was outside this budget. Reject
@@ -290,8 +296,9 @@ public actor FrameExtractor {
                 guard !token.isCancelled, !cancellation.isCancelled else { return nil }
                 do { try context.ensureOpen(control: control) } catch { return nil }
                 var actual: Double?
-                guard let image = context.decodeFrame(at: seconds, mode: .snapshot,
-                    targetWidth: 0, maxSize: maxSize,
+                // SVPlayer modification (2026-11-21): Forward caller FrameMode and bounded targetWidth to decodeFrame.
+                guard let image = context.decodeFrame(at: seconds, mode: mode,
+                    targetWidth: targetWidth, maxSize: maxSize,
                     isCancelled: { token.isCancelled || cancellation.isCancelled || control.isStopped },
                     reportDecodedTime: { actual = $0 }),
                     !token.isCancelled, !cancellation.isCancelled else { return nil }

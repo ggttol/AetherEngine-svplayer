@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 import AVFoundation
 import Combine
@@ -795,7 +796,8 @@ extension AetherEngine {
             ? Dictionary(
                 uniqueKeysWithValues: zip(tracks.map(\.externalID), prepared.renditionNames))
             : [:]
-        #if os(iOS)
+        // SVPlayer modification (2026-11-21): Enable LAN IP loopback rewrite on macOS AirPlay as well as iOS.
+        #if os(iOS) || os(macOS)
         // #86 / #227: a receiver cannot reach 127.0.0.1. Mounting while already AirPlaying has to hand out
         // the LAN address straight away; the route-change reload re-enters this path and re-resolves it.
         return airPlayActive ? airPlayHostSwapped(prepared.masterURL) : prepared.masterURL

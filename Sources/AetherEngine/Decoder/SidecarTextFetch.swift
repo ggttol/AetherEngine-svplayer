@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 
 /// AE#984: a text sidecar (SRT, WebVTT, ASS/SSA) over HTTP is read with ONE plain GET for the whole

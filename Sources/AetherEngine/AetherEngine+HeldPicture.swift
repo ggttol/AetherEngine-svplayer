@@ -1,3 +1,4 @@
+// SVPlayer modification (2026-11-21): Expose displayed pixel-buffer capture for live and non-seekable screenshots.
 import Foundation
 import AVFoundation
 import Combine
@@ -304,5 +305,25 @@ extension AetherEngine {
 
     private nonisolated static func milliseconds(_ duration: Duration) -> Int {
         Int(duration.components.seconds * 1000 + duration.components.attoseconds / 1_000_000_000_000_000)
+    }
+
+    // SVPlayer modification (2026-11-21): Expose live/non-seekable session check and active displayed-frame readback
+    // so live and forward-only streams can capture screenshots from the active renderer or AVPlayer output.
+    public var isCurrentSessionLiveOrNonSeekable: Bool {
+        guard isSessionReady else { return false }
+        if isLive { return true }
+        return isSourceSeekable == false || loadedOptions.sequentialOrigin
+    }
+
+    public func captureDisplayedPixelBuffer(timeout: Duration = .milliseconds(250)) async -> CVPixelBuffer? {
+        guard isSessionReady else { return nil }
+        if let host = softwareHost, nativeHost == nil {
+            return host.displayedFrame()
+        }
+        if let host = nativeHost,
+           !Self.heldPictureNeedsReshaping(videoFormat: videoFormat, dolbyVisionProfile: sourceDVProfile) {
+            return await host.captureDisplayedFrame(timeout: timeout)
+        }
+        return nil
     }
 }

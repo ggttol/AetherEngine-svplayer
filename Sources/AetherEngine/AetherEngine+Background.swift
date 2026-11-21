@@ -1,7 +1,41 @@
+// SVPlayer modification (2026-11-21): Synchronize foreground active state before reloads, exempt
+// active wireless AirPlay / external playback from background video teardown, and observe macOS AirPlay routes.
 import AVFoundation
 import Foundation
 #if canImport(UIKit)
 import UIKit
+#endif
+#if os(macOS)
+import CoreAudio
+
+private final class MacAudioRouteListener {
+    private let queue = DispatchQueue.main
+    private var block: AudioObjectPropertyListenerBlock?
+
+    init(onChange: @escaping @MainActor () -> Void) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let listener: AudioObjectPropertyListenerBlock = { _, _ in
+            MainActor.assumeIsolated { onChange() }
+        }
+        if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue, listener) == noErr {
+            block = listener
+        }
+    }
+
+    deinit {
+        guard let block else { return }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        _ = AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue, block)
+    }
+}
 #endif
 
 // The app lifecycle: what the engine does when the app goes to the background, comes back, loses its
@@ -38,20 +72,10 @@ extension AetherEngine {
             forName: UIApplication.didBecomeActiveNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                #if os(iOS)
-                self.cancelBackgroundGraceWindow()
-                self.softwareHost?.exitBackgroundAudioOnly()
-                #endif
-                // AE#588: read the flag before clearing it. `didBecomeActive` also follows a resign that
-                // never backgrounded the app (a system alert, a volume HUD), and the user cannot have
-                // reached the output format in that gap, so only a real return forgets the refusal.
-                let returnedFromBackground = self.isBackgrounded
-                self.isBackgrounded = false
-                if returnedFromBackground { Self.clearPanelRefusalOnForegroundReturn() }
-                self.backgroundActionOwed = false
-                self.noteVideoPresentationToHost()
+            // SVPlayer modification (2026-11-21): Clear isBackgrounded synchronously on .main so a host
+            // foreground reload triggered on didBecomeActive / scenePhase == .active never sees stale background state.
+            MainActor.assumeIsolated {
+                self?.noteForegroundActive()
             }
         }
         retainLifecycleObserver(fgObserver)
@@ -172,7 +196,28 @@ extension AetherEngine {
             }
         }
         retainLifecycleObserver(interruptionObserver)
+        #elseif os(macOS)
+        // SVPlayer modification (2026-11-21): Track macOS CoreAudio default output switches to/from AirPlay.
+        let routeListener = MacAudioRouteListener { [weak self] in
+            self?.recomputeAirPlayPictureStaysLocal()
+            self?.recheckInterlaceRouteForAirPlayReceiver()
+        }
+        retainAuxiliaryObserver(routeListener)
         #endif
+    }
+
+    // SVPlayer modification (2026-11-21): Idempotent foreground-active transition callable by both the
+    // lifecycle notification and host foreground-restore entry points before starting a reload.
+    public func noteForegroundActive() {
+        #if os(iOS)
+        cancelBackgroundGraceWindow()
+        softwareHost?.exitBackgroundAudioOnly()
+        #endif
+        let returnedFromBackground = isBackgrounded
+        isBackgrounded = false
+        if returnedFromBackground { Self.clearPanelRefusalOnForegroundReturn() }
+        backgroundActionOwed = false
+        noteVideoPresentationToHost()
     }
 
     // MARK: Owed background decision (audit CORE-2, LIF-101)
@@ -304,6 +349,8 @@ extension AetherEngine {
         var hasSoftwareHost = false
         var softwareHostHasAudio = false
         var pipActive = false
+        // SVPlayer modification (2026-11-21): Keep video alive when wireless AirPlay / external playback is active.
+        var externalPlaybackActive = false
         var backgroundPlaybackEnabled = true
         var retainsPausedVideoPipeline = false
         var graceSeconds: Double = 15
@@ -318,9 +365,15 @@ extension AetherEngine {
     }
 
     nonisolated static func backgroundKeepsVideoAlive(_ i: BackgroundDecisionInputs) -> Bool {
+        // SVPlayer modification (2026-11-21): Forward active external playback into the keepalive check.
         i.isTV
             ? shouldKeepVideoAliveTV(enabled: i.backgroundPlaybackEnabled, pipActive: i.pipActive)
-            : shouldKeepVideoAlive(enabled: i.backgroundPlaybackEnabled, pipActive: i.pipActive, state: i.state)
+            : shouldKeepVideoAlive(
+                enabled: i.backgroundPlaybackEnabled,
+                pipActive: i.pipActive,
+                externalPlaybackActive: i.externalPlaybackActive,
+                state: i.state
+            )
     }
 
     /// The one background decision every entry point asks (audit LIF-R201). Before it, `pause()`
@@ -372,6 +425,8 @@ extension AetherEngine {
             hasSoftwareHost: softwareHost != nil,
             softwareHostHasAudio: softwareHost?.deliversAudio == true,
             pipActive: pictureInPictureActive,
+            // SVPlayer modification (2026-11-21): Treat wireless AirPlay and external playback as active output.
+            externalPlaybackActive: externalPlaybackHoldsThePicture || airPlayActive || Self.isWirelessAirPlayRoute(),
             backgroundPlaybackEnabled: backgroundPlaybackEnabled,
             retainsPausedVideoPipeline: retainsVideoPipelineWhenBackgrounded,
             graceSeconds: backgroundTeardownGraceSeconds)

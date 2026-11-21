@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 
 /// AE#374: what the software path's master clock does once the producer is done.

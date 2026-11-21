@@ -1,3 +1,4 @@
+// SVPlayer modification (2026-11-21): Extend AirPlay interlace route recheck to macOS.
 import Foundation
 
 // AE#1070: a session the declared-interlace rule routed follows the AirPlay receiver mid-session. The
@@ -46,7 +47,8 @@ extension AetherEngine {
     }
 
     func recheckInterlaceRouteForAirPlayReceiver() {
-        #if os(iOS)
+        // SVPlayer modification (2026-11-21): Support wireless AirPlay receiver route switches on macOS as well as iOS.
+        #if os(iOS) || os(macOS)
         let receiverNow = Self.airPlayVideoReceiverHoldsRoute(
             wirelessAirPlayRoute: Self.isWirelessAirPlayRoute(),
             receiverShowsVideo: airPlayReceiverShowsVideo)

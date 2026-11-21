@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 
 /// Reads a playlist body with its size cap enforced while it arrives (audit NET-10).

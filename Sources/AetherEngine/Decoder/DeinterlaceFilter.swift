@@ -1,3 +1,4 @@
+// SVPlayer modification (2026-11-21): Respect DeinterlaceMode.off by bypassing filter graph construction.
 import Foundation
 import AetherLibavfilter
 import AetherLibavutil
@@ -119,7 +120,8 @@ final class DeinterlaceFilter {
             return true
         }
         teardown()
-        if passthroughLatched { return false }
+        // SVPlayer modification (2026-11-21): Bypass deinterlacing when explicitly disabled by host settings.
+        if config.mode == .off || passthroughLatched { return false }
 
         if config.mode == .auto, !hwDisabled {
             if buildGraph(frame: frame, timeBase: timeBase, engine: .hardware) {

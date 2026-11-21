@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 import AVFAudio
 import AetherLibavformat
@@ -194,10 +195,10 @@ final class AudioTapDecoder: @unchecked Sendable {
         var outLayout = AVChannelLayout()
         av_channel_layout_default(&outLayout, 1)
         var inLayout = AVChannelLayout()
-        if frame.pointee.ch_layout.nb_channels > 0 {
+        if frame.pointee.ch_layout.nb_channels > 0, frame.pointee.ch_layout.order != AV_CHANNEL_ORDER_UNSPEC {
             av_channel_layout_copy(&inLayout, &frame.pointee.ch_layout)
         } else {
-            av_channel_layout_default(&inLayout, 2)
+            av_channel_layout_default(&inLayout, frame.pointee.ch_layout.nb_channels > 0 ? frame.pointee.ch_layout.nb_channels : 2)
         }
         // copy() allocates a channel map for custom-order layouts; uninit or that map leaks.
         defer {

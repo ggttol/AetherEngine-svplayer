@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 import CoreGraphics
 import CoreMedia
@@ -651,7 +652,9 @@ final class FrameDecodeContext: @unchecked Sendable {
                 // (AV_NOPTS_VALUE == Int64.min) are accepted, so PTS-less streams
                 // degrade to the first frame after the seek.
                 if let ticks = offsetTicks, f.pointee.pts != Int64.min {
-                    targetPTS = f.pointee.pts + ticks
+                    let (target, overflow) = f.pointee.pts.addingReportingOverflow(ticks)
+                    guard !overflow else { return nil }
+                    targetPTS = target
                     offsetTicks = nil
                 }
                 if !mode.accepts(framePTS: f.pointee.pts, targetPTS: targetPTS) {

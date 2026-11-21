@@ -1,3 +1,4 @@
+// Modified by SVPlayer on 2026-11-20.
 import Foundation
 import AetherLibavformat
 import AetherLibavcodec
@@ -113,7 +114,15 @@ enum SubtitleDecoder {
         keepsBitmapPackets: Bool = false, formatHint: String? = nil, sourceOrigin: Double = 0
     ) async throws -> [SidecarDecodeResult] {
         if preparationPolicy == nil, let pair = SidecarTextFetch.vobSubPair(url) {
-            let index = try await SidecarTextFetch.downloadVobSub(pair, headers: httpHeaders)
+            let index: URL
+            do {
+                index = try await SidecarTextFetch.downloadVobSub(pair, headers: httpHeaders)
+            } catch SubtitleDecoderError.httpStatus(404) where url.pathExtension.lowercased() == "sub" {
+                let local = try await SidecarTextFetch.download(url, headers: httpHeaders, formatHint: "sub")
+                defer { try? FileManager.default.removeItem(at: local) }
+                return try await decode(url: local, httpHeaders: [:], preserveASSMarkup: preserveASSMarkup,
+                                        requested: requested, keepsBitmapPackets: keepsBitmapPackets, sourceOrigin: sourceOrigin)
+            }
             defer { try? FileManager.default.removeItem(at: index.deletingLastPathComponent()) }
             return try await decode(url: index, httpHeaders: [:], preserveASSMarkup: preserveASSMarkup,
                                     requested: requested, keepsBitmapPackets: keepsBitmapPackets, sourceOrigin: sourceOrigin)
