@@ -82,7 +82,12 @@ final class DoviDmPassthroughProbe: @unchecked Sendable {
         case "hex": mode = .hex
         default: mode = .log
         }
+        // SVPlayer modification (2026-11-21): Restrict AETHER_DM_DIGEST_FILE disk output to DEBUG builds.
+        #if DEBUG
         filePath = environment["AETHER_DM_DIGEST_FILE"]
+        #else
+        filePath = nil
+        #endif
     }
 
     var isOn: Bool { mode != .off || sink != nil }

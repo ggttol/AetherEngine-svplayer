@@ -883,7 +883,8 @@ public final class AetherEngine: ObservableObject {
 
     /// iOS: whether the system is mirroring this screen, as the host reports it
     /// (`UITraitCollection.sceneCaptureState` is `.active`). Only `airPlayPictureStaysLocal` reads it.
-    private(set) var screenMirrored = false
+    // SVPlayer modification (2026-11-21): Expose public getter so SVPlayerEngine can inspect live mirroring state.
+    public private(set) var screenMirrored = false
 
     /// Tell the engine whether the screen is being mirrored. A mirror carries the software host's layer
     /// to the receiver, so `airPlayPictureStaysLocal` reads false while it is on. The engine has no scene
@@ -899,7 +900,8 @@ public final class AetherEngine: ObservableObject {
     /// reports it. False, the default, means an audio-only output or unknown. There is no public way for
     /// the engine to tell the two apart: the audio session reports every AirPlay output as the same port
     /// type. See `setAirPlayReceiverShowsVideo(_:)`.
-    private(set) var airPlayReceiverShowsVideo = false
+    // SVPlayer modification (2026-11-21): Expose public getter so SVPlayerEngine can inspect live AirPlay video receiver state.
+    public private(set) var airPlayReceiverShowsVideo = false
 
     /// Tell the engine whether the AirPlay receiver the viewer picked shows video. While one does, a
     /// Profile 7 FEL source loads on the native route (8.1 where the display takes Dolby Vision, the
@@ -1404,7 +1406,7 @@ public final class AetherEngine: ObservableObject {
     /// unconditional teardown that protects mediaserverd across multi-hour suspensions.
     // SVPlayer modification (2026-11-21): Keep an active tvOS PiP window alive regardless of background audio toggle.
     nonisolated static func shouldKeepVideoAliveTV(enabled: Bool, pipActive: Bool) -> Bool {
-        pipActive || (enabled && pipActive)
+        pipActive
     }
 
     /// AE#158: a system PiP window closes the moment its source layer's player drops its item (the #93
@@ -6825,9 +6827,13 @@ public final class AetherEngine: ObservableObject {
         // AE#464 round 2: come back in the transport state the session is IN, not the one its first
         // mount was given. Written before the branch because only the URL branch below carries a
         // struct into `load`; the custom-source branch reads `loadedOptions` field by field.
-        // SVPlayer modification (2026-11-21): Explicit caller autoplay overrides stale mount autoplay
-        // so paused or app-locked sessions never briefly play audio during foreground reload.
-        setLoadedAutoplay(autoplay ?? sessionRebuildResumesPlaying)
+        // SVPlayer modification (2026-11-21): Explicit caller autoplay overrides stale mount autoplay;
+        // when autoplay is nil on a torn-down session, preserve loadedOptions.autoplay instead of overwriting with false.
+        if let autoplay {
+            setLoadedAutoplay(autoplay)
+        } else if !resumesTornDownSession {
+            setLoadedAutoplay(sessionRebuildResumesPlaying)
+        }
         if isCustomSource {
             // Rebuild on retained reader (seekable only); no URL to reopen.
             //

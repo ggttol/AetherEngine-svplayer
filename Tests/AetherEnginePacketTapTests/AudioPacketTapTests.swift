@@ -353,6 +353,8 @@ final class AudioPacketTapTests: XCTestCase {
             }
             let head = AtomicDouble(0)
             let deliveredEnd = AtomicDouble(0)
+            // SVPlayer modification (2026-11-21): Await worker thread exit via finish semaphore when timing stop().
+            let finished = DispatchSemaphore(value: 0)
             let tap = AudioPacketTap(
                 packets: packets,
                 channels: .downmix,
@@ -362,7 +364,10 @@ final class AudioPacketTapTests: XCTestCase {
                 yield: { buffer in
                     deliveredEnd.set(buffer.sourceTime + Double(buffer.buffer.frameLength) / buffer.buffer.format.sampleRate)
                 },
-                finish: {}
+                // SVPlayer modification (2026-11-21): Signal semaphore when AudioPacketTap worker thread exits.
+                finish: {
+                    finished.signal()
+                }
             )
             tap.begin()
             defer { tap.stop() }
@@ -386,10 +391,13 @@ final class AudioPacketTapTests: XCTestCase {
             XCTAssertLessThan(wakeElapsed, 0.5, "Playhead change must wake paused tap without waiting out idle sleep")
 
             Thread.sleep(forTimeInterval: 0.05)
+            // SVPlayer modification (2026-11-21): Measure actual worker exit via finish callback rather than non-blocking stop() return.
             let stopStart = ProcessInfo.processInfo.systemUptime
             tap.stop()
+            let waitResult = finished.wait(timeout: .now() + 0.5)
             let stopElapsed = ProcessInfo.processInfo.systemUptime - stopStart
-            XCTAssertLessThan(stopElapsed, 0.25, "stop() must wake parked AudioPacketTap worker immediately")
+            XCTAssertEqual(waitResult, .success, "AudioPacketTap worker thread must invoke finish promptly on stop()")
+            XCTAssertLessThan(stopElapsed, 0.25, "stop() must wake parked AudioPacketTap worker and exit immediately")
         }
     }
 }

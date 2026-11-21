@@ -74,6 +74,53 @@ final class EngineAuditFixTests: XCTestCase {
         XCTAssertEqual(engine.consumeReloadSelection().audioTrackIndex, 3)
     }
 
+    // SVPlayer modification (2026-11-21): Regression test for NEW-03 ensuring parameterless and option-applying
+    // reloadAtCurrentPosition calls preserve loadedOptions.autoplay on a background-torn-down session.
+    @MainActor
+    func testParameterlessAndApplyingReloadPreserveTornDownAutoplayContract() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+
+        engine.loadedURL = URL(fileURLWithPath: "/nonexistent/torn-down-autoplay-\(UUID().uuidString).mkv")
+        engine.setLoadedAutoplay(true)
+        engine.restoreReloadSelection(
+            BackgroundTeardownSelection(
+                audioTrackIndex: 2,
+                discTitleID: nil,
+                requiresDeinterlaceWarmup: false
+            )
+        )
+
+        do {
+            try await engine.reloadAtCurrentPosition()
+            XCTFail("Expected parameterless reload of nonexistent file to throw")
+        } catch {
+            // Expected failure
+        }
+
+        XCTAssertTrue(
+            engine.loadedOptions.autoplay,
+            "Parameterless reloadAtCurrentPosition() on a torn-down session must preserve loadedOptions.autoplay == true"
+        )
+        XCTAssertTrue(engine.needsForegroundVideoRestore)
+
+        engine.setLoadedAutoplay(false)
+        do {
+            _ = try await engine.reloadAtCurrentPosition { options in
+                options.autoplay = true
+            }
+            XCTFail("Expected reloadAtCurrentPosition(applying:) of nonexistent file to throw")
+        } catch {
+            // Expected failure
+        }
+
+        XCTAssertTrue(
+            engine.loadedOptions.autoplay,
+            "reloadAtCurrentPosition(applying: { $0.autoplay = true }) on a torn-down session must not overwrite autoplay back to false"
+        )
+        XCTAssertTrue(engine.needsForegroundVideoRestore)
+    }
+
     func testDeinterlaceModeOffBypassesFilterGraphConstruction() throws {
         let frame = try XCTUnwrap(av_frame_alloc())
         var owned: UnsafeMutablePointer<AVFrame>? = frame
