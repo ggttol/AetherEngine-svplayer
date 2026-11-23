@@ -7,7 +7,7 @@ The modified version is used by the SVPlayer app (iOS, iPadOS, macOS, tvOS).
 
 All changes are in the commits on top of upstream history; `git diff 572a8f7` shows them in full.
 
-## Summary of changes (2026-11-20, updated 2026-11-21)
+## Summary of changes (2026-11-20, updated 2026-11-23)
 
 - Audio packet tap: a public `audioTap` API that forwards the selected audio track's packets, decoded to
   PCM with their source timestamps, from the demux layer (HLS segment producer, software host and
@@ -20,3 +20,4 @@ All changes are in the commits on top of upstream history; `git diff 572a8f7` sh
 
 Modified source files carry a `SVPlayer modification` comment at each change.
 - 2026-11-21: foreground restore and background teardown fixes, AirPlay / Picture in Picture background handling, audio packet window de-duplication, and audit fixes (see SVPlayer modification comments in each file).
+- 2026-11-23: audio packet tap moved to an event-driven serial queue (no blocking wait on a higher-QoS thread, fixing QoS priority-inversion warnings); ML upscaler timing capture fix; Picture in Picture area tracker main-actor fix.

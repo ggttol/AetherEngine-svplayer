@@ -37,33 +37,9 @@ struct AudioTapOutputClock {
     }
 }
 
-// SVPlayer modification (2026-11-21): Monotonic condition signal so AudioPacketTap sleeps without
-// 25 Hz polling while paused and wakes immediately on resume, stop, seek, or packet/epoch updates.
-final class AudioTapWakeSignal: @unchecked Sendable {
-    private let condition = NSCondition()
-    private var generation: UInt64 = 0
-
-    var snapshot: UInt64 {
-        condition.lock()
-        defer { condition.unlock() }
-        return generation
-    }
-
-    func signal() {
-        condition.lock()
-        generation &+= 1
-        condition.broadcast()
-        condition.unlock()
-    }
-
-    func wait(since observed: UInt64, timeout: TimeInterval) {
-        guard timeout > 0 else { return }
-        condition.lock()
-        defer { condition.unlock() }
-        guard generation == observed else { return }
-        _ = condition.wait(until: Date(timeIntervalSinceNow: timeout))
-    }
-}
+// SVPlayer modification (2026-11-23): Event-driven serial queue scheduling replaces blocking
+// NSCondition.wait on a higher-QoS global queue, eliminating Darwin QoS priority inversion
+// warnings while keeping zero-poll idle sleeping and immediate wakeups on packet/playhead/stop updates.
 
 /// SVPlayer modification. One decoder per installed tap. The playback demux always has priority.
 /// A cancellable AVIO reader can fill a missing interval on seekable VOD after a short grace period.
@@ -76,14 +52,31 @@ final class AudioPacketTap: @unchecked Sendable {
     private let yield: @Sendable (AudioTapBuffer) -> Void
     private let finish: @Sendable () -> Void
     private let lock = NSLock()
-    // SVPlayer modification (2026-11-21): Condition wake signal and observer tokens replacing polling sleeps.
-    private let wake = AudioTapWakeSignal()
+    // SVPlayer modification (2026-11-23): Default-QoS serial queue inherits caller QoS (including stop())
+    // without parking a higher-QoS worker thread on a lower-QoS signaller.
+    private let workerQueue = DispatchQueue(label: "aether.audiotap.worker")
     private var primaryObserverID: UUID?
     private var sideObserverID: UUID?
+    private var started = false
+    private var scheduled = false
     private var stopped = false
     private var lookahead: AudioPacketLookahead?
     private var preparedEnd: Double?
     private var linkRestricted = false
+
+    // Worker-queue-only state.
+    private var finished = false
+    private var wakeTimer: DispatchSourceTimer?
+    private var decoder: AudioTapDecoder
+    private var primaryCursor = AudioPacketWindow.Cursor()
+    private var sideCursor = AudioPacketWindow.Cursor()
+    private var lastInput: Double?
+    private var output = AudioTapOutputClock()
+    private var lastUsedSide = false
+    private var landing: Double
+    private var formatVersion: UInt64?
+    private var refill = AudioTapRefill()
+    private var discontinuity = true
 
     var progress: AudioTapProgress {
         let (end, reader, restricted) = lock.withLock { (preparedEnd, lookahead, linkRestricted) }
@@ -99,6 +92,8 @@ final class AudioPacketTap: @unchecked Sendable {
         self.packets = packets
         self.channels = channels
         self.start = start
+        self.landing = start
+        self.decoder = AudioTapDecoder(channels: channels)
         self.playhead = playhead
         self.source = source
         self.yield = yield
@@ -106,96 +101,137 @@ final class AudioPacketTap: @unchecked Sendable {
     }
 
     func begin() {
-        // SVPlayer modification (2026-11-21): Register wake hooks before starting the worker loop.
-        let wake = self.wake
-        let observerID = packets.addMutationObserver { wake.signal() }
-        lock.withLock { primaryObserverID = observerID }
-        playhead.setOnChange { wake.signal() }
-        DispatchQueue.global(qos: .userInitiated).async { [self] in run() }
+        // SVPlayer modification (2026-11-23): Register wake hooks before scheduling event-driven decode steps.
+        let observerID = packets.addMutationObserver { [weak self] in self?.scheduleStep() }
+        let shouldStart = lock.withLock { () -> Bool in
+            guard !started else { return false }
+            started = true
+            primaryObserverID = observerID
+            return true
+        }
+        guard shouldStart else {
+            packets.removeMutationObserver(observerID)
+            return
+        }
+        playhead.setOnChange { [weak self] in self?.scheduleStep() }
+        scheduleStep()
     }
 
     func notifyWake() {
-        wake.signal()
+        scheduleStep()
     }
 
     func stop() {
-        let (reader, primaryID, sideID) = lock.withLock {
+        let (reader, primaryID, sideID, shouldSchedule) = lock.withLock {
             stopped = true
             let primaryID = primaryObserverID
             let sideID = sideObserverID
             primaryObserverID = nil
             sideObserverID = nil
-            return (lookahead, primaryID, sideID)
+            let shouldSchedule = started && !scheduled
+            if shouldSchedule { scheduled = true }
+            return (lookahead, primaryID, sideID, shouldSchedule)
         }
         if let primaryID { packets.removeMutationObserver(primaryID) }
         if let sideID { reader?.packets.removeMutationObserver(sideID) }
         playhead.setOnChange(nil)
         reader?.stop()
-        wake.signal()
+        if shouldSchedule {
+            workerQueue.async { [self] in step() }
+        }
+    }
+
+    private func scheduleStep() {
+        let shouldDispatch = lock.withLock { () -> Bool in
+            guard started, !scheduled else { return false }
+            scheduled = true
+            return true
+        }
+        guard shouldDispatch else { return }
+        workerQueue.async { [self] in step() }
     }
 
     private func sideReader(for format: AudioPacketWindow.Format) -> AudioPacketLookahead? {
         guard let source else { return nil }
         let limited = OriginRequestBudget.shared.isPaced(source.url)
             || OriginRequestBudget.shared.requiresSerialRequests(source.url)
-        let wake = self.wake
         return lock.withLock {
             linkRestricted = limited
             guard !stopped, !limited else { return nil }
             if lookahead == nil {
                 let created = AudioPacketLookahead(source: source, format: format, sourceOffset: packets.sourceOffset)
-                sideObserverID = created.packets.addMutationObserver { wake.signal() }
+                sideObserverID = created.packets.addMutationObserver { [weak self] in self?.scheduleStep() }
                 lookahead = created
             }
             return lookahead
         }
     }
 
-    private func run() {
-        var decoder = AudioTapDecoder(channels: channels)
-        // SVPlayer modification (2026-11-21): Detach packet-window and playhead wake hooks when worker exits.
-        defer {
-            let (primaryID, reader, sideID) = lock.withLock {
-                let primaryID = primaryObserverID
-                let sideID = sideObserverID
-                primaryObserverID = nil
-                sideObserverID = nil
-                return (primaryID, lookahead, sideID)
-            }
-            if let primaryID { packets.removeMutationObserver(primaryID) }
-            if let sideID { reader?.packets.removeMutationObserver(sideID) }
-            playhead.setOnChange(nil)
-            decoder.close()
-            finish()
-        }
-        var primaryCursor = AudioPacketWindow.Cursor()
-        var sideCursor = AudioPacketWindow.Cursor()
-        var lastInput: Double?
-        var output = AudioTapOutputClock()
-        var lastUsedSide = false
-        var landing = start
-        var formatVersion: UInt64?
-        var refill = AudioTapRefill()
-        var discontinuity = true
+    private func cancelTimer() {
+        wakeTimer?.cancel()
+        wakeTimer = nil
+    }
 
-        func deliver(_ chunks: [AudioTapChunk]) {
-            for chunk in chunks {
-                discontinuity = discontinuity || chunk.discontinuity
-                guard let current = output.accept(chunk, landing: landing, discontinuity: discontinuity) else { continue }
-                lock.lock()
-                guard !stopped else { lock.unlock(); return }
-                preparedEnd = output.deliveredEnd
-                yield(current)
-                lock.unlock()
-                discontinuity = false
-            }
+    private func armTimer(after delay: TimeInterval) {
+        cancelTimer()
+        let timer = DispatchSource.makeTimerSource(queue: workerQueue)
+        timer.schedule(deadline: .now() + max(0.005, delay), leeway: .milliseconds(5))
+        timer.setEventHandler { [weak self] in
+            self?.cancelTimer()
+            self?.step()
         }
+        wakeTimer = timer
+        timer.resume()
+    }
 
-        while !lock.withLock({ stopped }) {
-            // SVPlayer modification (2026-11-21): Snapshot wake generation before inspecting state/window
-            // so any concurrent resume, stop, seek, or packet append wakes wait(since:timeout:) immediately.
-            let wakeToken = wake.snapshot
-            guard let format = packets.format else { return }
+    private func deliver(_ chunks: [AudioTapChunk]) {
+        for chunk in chunks {
+            discontinuity = discontinuity || chunk.discontinuity
+            guard let current = output.accept(chunk, landing: landing, discontinuity: discontinuity) else { continue }
+            lock.lock()
+            guard !stopped else { lock.unlock(); return }
+            preparedEnd = output.deliveredEnd
+            yield(current)
+            lock.unlock()
+            discontinuity = false
+        }
+    }
+
+    private func finalize() {
+        guard !finished else { return }
+        finished = true
+        cancelTimer()
+        let (primaryID, reader, sideID) = lock.withLock {
+            stopped = true
+            let primaryID = primaryObserverID
+            let sideID = sideObserverID
+            primaryObserverID = nil
+            sideObserverID = nil
+            return (primaryID, lookahead, sideID)
+        }
+        if let primaryID { packets.removeMutationObserver(primaryID) }
+        if let sideID { reader?.packets.removeMutationObserver(sideID) }
+        playhead.setOnChange(nil)
+        decoder.close()
+        finish()
+    }
+
+    private func step() {
+        cancelTimer()
+        guard !finished else { return }
+        while true {
+            let isStopped = lock.withLock { () -> Bool in
+                scheduled = false
+                return stopped
+            }
+            if isStopped {
+                finalize()
+                return
+            }
+            guard let format = packets.format else {
+                finalize()
+                return
+            }
             if formatVersion != format.version {
                 let (old, oldSideID) = lock.withLock {
                     let old = lookahead
@@ -212,6 +248,7 @@ final class AudioPacketTap: @unchecked Sendable {
                 do { try decoder.open(parameters: format.parameters.ptr, timeBase: format.timeBase) }
                 catch {
                     EngineLog.emit("[AudioTap] decoder unavailable stream=\(format.streamIndex) error=\(error)", category: .engine)
+                    finalize()
                     return
                 }
                 formatVersion = format.version
@@ -231,9 +268,8 @@ final class AudioPacketTap: @unchecked Sendable {
             let atEnd = packets.hasEnded(at: frontier)
                 || lock.withLock({ lookahead })?.packets.hasEnded(at: frontier) == true
             if frontier >= head + AudioTapDefaults.leadSeconds, !atEnd {
-                // SVPlayer modification (2026-11-21): Sleep on wake signal instead of 25 Hz Thread.sleep while paused.
-                wake.wait(since: wakeToken, timeout: 2.0)
-                continue
+                armTimer(after: 2.0)
+                return
             }
             let floor = max(landing - 0.25, lastInput ?? landing - 0.25)
             // Reject old-position packets even if their producer finishes after seek. A genuine
@@ -262,11 +298,11 @@ final class AudioPacketTap: @unchecked Sendable {
             guard let packet else {
                 if atEnd {
                     deliver(decoder.drain())
+                    finalize()
                     return
                 }
-                // SVPlayer modification (2026-11-21): Wait for packet/EOF wake signal instead of 50 Hz busy sleep.
-                wake.wait(since: wakeToken, timeout: 0.20)
-                continue
+                armTimer(after: 0.20)
+                return
             }
             if let lastInput, packet.start < lastInput - 0.000_001
                 || (usingSide != lastUsedSide && packet.start <= lastInput + 0.000_001) { continue }

@@ -227,8 +227,9 @@ final class PictureInPictureAreaTracker {
             if Thread.isMainThread {
                 MainActor.assumeIsolated { view.postsFrameChangedNotifications = before }
             } else {
-                nonisolated(unsafe) let unsafeView = view
-                DispatchQueue.main.async { unsafeView.postsFrameChangedNotifications = before }
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { view.postsFrameChangedNotifications = before }
+                }
             }
         }
 
