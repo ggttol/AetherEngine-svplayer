@@ -313,6 +313,317 @@ public actor FrameExtractor {
         return !Task.isCancelled && !cancellation.isCancelled && !token.isCancelled ? result : nil
     }
 
+    // SVPlayer modification (2026-11-25): smart keyframe seek offset strategy for
+    // directory video thumbnails — prefers ~10% or 60–120s over 0.0s to avoid opening
+    // black fade-ins / broken open-GOP leading frames, falling back to 0.0s.
+    public nonisolated static func candidateThumbnailOffsets(durationSeconds: Double?) -> [Double] {
+        guard let duration = durationSeconds, duration.isFinite, duration > 0 else {
+            return [10.0, 0.0]
+        }
+        if duration >= 600.0 {
+            let primary = min(120.0, max(60.0, (duration * 0.10).rounded()))
+            let secondary = min(30.0, max(10.0, (duration * 0.05).rounded()))
+            return deduplicatedOffsets([primary, secondary, 0.0])
+        }
+        if duration >= 20.0 {
+            let primary = max(2.0, min(60.0, (duration * 0.10).rounded()))
+            return deduplicatedOffsets([primary, 0.0])
+        }
+        if duration >= 2.0 {
+            let primary = min(max(1.0, duration * 0.15), max(0.5, duration - 0.5))
+            return deduplicatedOffsets([primary, 0.0])
+        }
+        return [0.0]
+    }
+
+    private nonisolated static func deduplicatedOffsets(_ raw: [Double]) -> [Double] {
+        var result: [Double] = []
+        for value in raw where value.isFinite && value >= 0 {
+            if !result.contains(where: { abs($0 - value) < 0.25 }) {
+                result.append(value)
+            }
+        }
+        return result.isEmpty ? [0.0] : result
+    }
+
+    // SVPlayer modification (2026-11-25): directory-thumbnail extraction with a single
+    // open demuxer/decoder, LAN-friendly 512 KiB HTTP chunking + configurable chunk timeout,
+    // smart multi-target seeking (skipping opening black frames), DV P5 IPT-PQ -> SDR
+    // fallback, and full redacted diagnostics.
+    public func extractThumbnailWithDiagnostics(
+        candidateOffsets: [Double]? = nil,
+        maxSize: CGSize,
+        limits: ProbeLimits,
+        cancellation: ProbeCancellation,
+        chunkSize: Int = 512 * 1024,
+        chunkRequestTimeout: TimeInterval = 6.0
+    ) async -> ThumbnailExtractionOutcome {
+        guard !isShutDown else {
+            return ThumbnailExtractionOutcome(
+                image: nil,
+                diagnostics: ThumbnailExtractionDiagnostics(failureStage: "extractor_shutdown")
+            )
+        }
+        guard !Task.isCancelled, !cancellation.isCancelled else {
+            return ThumbnailExtractionOutcome(
+                image: nil,
+                diagnostics: ThumbnailExtractionDiagnostics(failureStage: "cancelled")
+            )
+        }
+        guard let control = try? ProbeControl(limits: limits, cancellation: cancellation) else {
+            return ThumbnailExtractionOutcome(
+                image: nil,
+                diagnostics: ThumbnailExtractionDiagnostics(failureStage: "invalid_limits")
+            )
+        }
+
+        currentToken?.cancel()
+        boundedCancellation?.cancel()
+        boundedCancellation = cancellation
+        let token = CancelToken()
+        currentToken = token
+        let context = self.context
+        let targetWidth = max(64, Int(maxSize.width.rounded(.down)))
+
+        let outcome: ThumbnailExtractionOutcome = await withTaskCancellationHandler {
+            await runOnQueue { () -> ThumbnailExtractionOutcome in
+                guard !context.isOpen else {
+                    control.finish()
+                    return ThumbnailExtractionOutcome(
+                        image: nil,
+                        diagnostics: ThumbnailExtractionDiagnostics(failureStage: "context_already_open")
+                    )
+                }
+                defer {
+                    context.close()
+                    control.finish()
+                }
+                guard !token.isCancelled, !cancellation.isCancelled else {
+                    return ThumbnailExtractionOutcome(
+                        image: nil,
+                        diagnostics: ThumbnailExtractionDiagnostics(failureStage: "cancelled")
+                    )
+                }
+
+                func makeDiagnostics(
+                    seekSeconds: Double,
+                    actualSeconds: Double?,
+                    failureStage: String?,
+                    detail: String? = nil
+                ) -> ThumbnailExtractionDiagnostics {
+                    var resolvedStage = failureStage
+                    let resolvedDetail = detail
+                    if let stopError = control.recordedFailure {
+                        switch stopError {
+                        case is CancellationError:
+                            resolvedStage = "cancelled"
+                        case ProbeError.timedOut:
+                            resolvedStage = "budget_timeout"
+                        case ProbeError.inputLimit:
+                            resolvedStage = "budget_input_limit"
+                        case ProbeError.packetLimit:
+                            resolvedStage = "budget_packet_limit"
+                        case ProbeError.packetSizeLimit:
+                            resolvedStage = "budget_packet_size"
+                        default:
+                            if resolvedStage == nil { resolvedStage = "probe_stopped" }
+                        }
+                    }
+                    return ThumbnailExtractionDiagnostics(
+                        container: context.containerName,
+                        codec: context.codecName,
+                        profile: context.profileName,
+                        bitDepth: context.bitDepth,
+                        hdrType: context.hdrType,
+                        dvProfile: context.dvProfile,
+                        durationSeconds: context.openDurationSeconds,
+                        seekSeconds: seekSeconds,
+                        actualSeconds: actualSeconds,
+                        bytesRead: max(control.consumedInputBytes, context.bytesFetched),
+                        packetsRead: control.consumedPacketCount,
+                        colorPath: context.lastColorPath,
+                        failureStage: resolvedStage,
+                        ffmpegErrorCode: context.lastFFmpegErrorCode,
+                        detail: resolvedDetail
+                    )
+                }
+
+                do {
+                    try context.ensureOpen(
+                        control: control,
+                        chunkSize: chunkSize,
+                        chunkRequestTimeout: chunkRequestTimeout,
+                        chunkMaxRetries: 2,
+                        boundedWindowBytes: chunkSize
+                    )
+                } catch {
+                    let stage = context.lastDecodeFailureStage ?? "open_failed"
+                    return ThumbnailExtractionOutcome(
+                        image: nil,
+                        diagnostics: makeDiagnostics(
+                            seekSeconds: 0,
+                            actualSeconds: nil,
+                            failureStage: stage,
+                            detail: String(describing: type(of: error))
+                        )
+                    )
+                }
+
+                // SVPlayer modification (2026-11-25): do not decode or color-convert
+                // Dolby Vision Profile 5/20/10.0 (no base layer) when the optional
+                // DolbyVisionStillReshaping trait is disabled; report dv_p5_unsupported
+                // immediately so directory cards fall back to official thumbnails or placeholder.
+                if !FrameDecodeContext.yieldsStill(dolbyVisionNoBaseLayer: context.isDolbyVisionNoBaseLayer) {
+                    return ThumbnailExtractionOutcome(
+                        image: nil,
+                        diagnostics: makeDiagnostics(
+                            seekSeconds: 0,
+                            actualSeconds: nil,
+                            failureStage: "dv_p5_unsupported"
+                        )
+                    )
+                }
+
+                let duration = context.openDurationSeconds
+                let origin = context.openStartSeconds
+                var offsets = candidateOffsets ?? Self.candidateThumbnailOffsets(durationSeconds: duration)
+                if offsets.isEmpty { offsets = [0.0] }
+
+                var triedOffsets: [Double] = []
+                var bestBlackFallback: (image: CGImage, seekSeconds: Double, actualSeconds: Double?)?
+                var lastSeekAttempted: Double = offsets[0]
+
+                func isStopped() -> Bool {
+                    token.isCancelled || cancellation.isCancelled || control.isStopped
+                }
+
+                var index = 0
+                while index < offsets.count {
+                    guard !isStopped() else { break }
+                    let relativeOffset = offsets[index]
+                    index += 1
+                    if triedOffsets.contains(where: { abs($0 - relativeOffset) < 0.25 }) {
+                        continue
+                    }
+                    triedOffsets.append(relativeOffset)
+                    lastSeekAttempted = relativeOffset
+                    let absoluteTarget = origin + relativeOffset
+
+                    var decodedTime: Double?
+                    if let image = context.decodeFrame(
+                        at: absoluteTarget,
+                        mode: .thumbnail,
+                        targetWidth: targetWidth,
+                        maxSize: maxSize,
+                        isCancelled: isStopped,
+                        reportDecodedTime: { decodedTime = $0 }
+                    ) {
+                        let actualRelative = decodedTime.map { max(0, $0 - origin) }
+                        if !FrameDecodeContext.isMostlyBlack(image) {
+                            let diag = makeDiagnostics(
+                                seekSeconds: relativeOffset,
+                                actualSeconds: actualRelative,
+                                failureStage: nil
+                            )
+                            return ThumbnailExtractionOutcome(image: image, diagnostics: diag)
+                        }
+                        if bestBlackFallback == nil {
+                            bestBlackFallback = (image, relativeOffset, actualRelative)
+                        }
+                        // If we landed on a black frame and still have budget, try one further
+                        // point deeper into the video before settling for a black frame.
+                        if let duration, (control.remainingTime ?? 0) > 1.8 {
+                            let deeper: Double
+                            if duration >= 120 {
+                                deeper = min(duration * 0.25, relativeOffset + 60.0)
+                            } else if duration >= 10 {
+                                deeper = min(duration * 0.50, max(5.0, relativeOffset + duration * 0.25))
+                            } else {
+                                deeper = min(max(0.5, duration * 0.50), max(0.5, duration - 0.5))
+                            }
+                            if !triedOffsets.contains(where: { abs($0 - deeper) < 0.5 }) {
+                                offsets.insert(deeper, at: index)
+                            }
+                        }
+                    }
+                }
+
+                // Final non-seeking decode attempt for indexless/unseekable TS or AVI streams.
+                if bestBlackFallback == nil && !isStopped() {
+                    var decodedTime: Double?
+                    if let image = context.decodeFrame(
+                        at: origin,
+                        mode: .thumbnail,
+                        targetWidth: targetWidth,
+                        maxSize: maxSize,
+                        isCancelled: isStopped,
+                        reportDecodedTime: { decodedTime = $0 },
+                        skipSeek: true
+                    ) {
+                        let actualRelative = decodedTime.map { max(0, $0 - origin) }
+                        return ThumbnailExtractionOutcome(
+                            image: image,
+                            diagnostics: makeDiagnostics(
+                                seekSeconds: 0,
+                                actualSeconds: actualRelative,
+                                failureStage: nil,
+                                detail: "no_seek_fallback"
+                            )
+                        )
+                    }
+                }
+
+                if let fallback = bestBlackFallback, !token.isCancelled, !cancellation.isCancelled {
+                    return ThumbnailExtractionOutcome(
+                        image: fallback.image,
+                        diagnostics: makeDiagnostics(
+                            seekSeconds: fallback.seekSeconds,
+                            actualSeconds: fallback.actualSeconds,
+                            failureStage: nil,
+                            detail: "dark_frame_fallback"
+                        )
+                    )
+                }
+
+                let stage = context.lastDecodeFailureStage ?? "decode_frame"
+                return ThumbnailExtractionOutcome(
+                    image: nil,
+                    diagnostics: makeDiagnostics(
+                        seekSeconds: lastSeekAttempted,
+                        actualSeconds: nil,
+                        failureStage: stage
+                    )
+                )
+            }
+        } onCancel: {
+            token.cancel()
+            cancellation.cancel()
+        }
+
+        if boundedCancellation === cancellation { boundedCancellation = nil }
+        if Task.isCancelled || cancellation.isCancelled || token.isCancelled {
+            return ThumbnailExtractionOutcome(
+                image: nil,
+                diagnostics: ThumbnailExtractionDiagnostics(
+                    container: outcome.diagnostics.container,
+                    codec: outcome.diagnostics.codec,
+                    profile: outcome.diagnostics.profile,
+                    bitDepth: outcome.diagnostics.bitDepth,
+                    hdrType: outcome.diagnostics.hdrType,
+                    dvProfile: outcome.diagnostics.dvProfile,
+                    durationSeconds: outcome.diagnostics.durationSeconds,
+                    seekSeconds: outcome.diagnostics.seekSeconds,
+                    actualSeconds: outcome.diagnostics.actualSeconds,
+                    bytesRead: outcome.diagnostics.bytesRead,
+                    packetsRead: outcome.diagnostics.packetsRead,
+                    colorPath: outcome.diagnostics.colorPath,
+                    failureStage: "cancelled"
+                )
+            )
+        }
+        return outcome
+    }
+
     /// Open the decode context ahead of the first request to hide cold-start latency
     /// (e.g. at the start of a scrub gesture).
     public func prewarm() async {

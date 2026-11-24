@@ -96,13 +96,18 @@ final class ProbeHTTPReader: IOReader, @unchecked Sendable {
             || DiscImageMediaType.isDiscImage(contentType: reader.openResponseContentType)
     }
 
+    // SVPlayer modification (2026-11-25): allow thumbnail extraction to specify
+    // LAN-appropriate chunk size and request timeout instead of fixed 64 KiB / 2 s.
     init(url: URL, headers: [String: String], control: ProbeControl,
-         boundedWindowBytes: Int? = nil) {
+         boundedWindowBytes: Int? = nil,
+         chunkSize: Int = 64 * 1024,
+         chunkRequestTimeout: TimeInterval = 2,
+         chunkMaxRetries: Int = 1) {
         isDiscImageURL = Demuxer.isDiscImageURL(url)
         reader = AVIOReader(
             url: url, extraHeaders: headers, label: "probe",
-            chunkSize: 64 * 1024, prefetchEnabled: false,
-            chunkRequestTimeout: 2, chunkMaxRetries: 1,
+            chunkSize: max(64 * 1024, chunkSize), prefetchEnabled: false,
+            chunkRequestTimeout: max(1, chunkRequestTimeout), chunkMaxRetries: max(1, chunkMaxRetries),
             boundedInitialFetch: boundedWindowBytes.map { Int64($0) },
             windowHighWater: boundedWindowBytes, probeControl: control,
             probeRangeCeiling: boundedWindowBytes == nil ? Self.rangeCeiling : nil)

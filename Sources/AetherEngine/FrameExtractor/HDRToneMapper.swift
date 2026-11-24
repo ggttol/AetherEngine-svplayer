@@ -32,12 +32,20 @@ struct HDRToneMapper {
         // properties on the fly is not supported by all filters. zscale reads the frame rather than the
         // link, so this was never the cause of a failure, but a graph that describes its own input
         // wrongly is a bad place to debug the next one from.
+        // SVPlayer modification (2026-11-25): HDR MKV/TS rips frequently omit
+        // explicit primaries/matrix on individual frames while tagging PQ/HLG.
+        // Supply BT.2020 defaults to zscale so tone-mapping succeeds instead of
+        // failing with error 3074 (no path to linear).
+        let effectiveColorSpace: AVColorSpace = frame.pointee.colorspace == AVCOL_SPC_UNSPECIFIED
+            ? AVCOL_SPC_BT2020_NCL : frame.pointee.colorspace
+        let effectiveRange: AVColorRange = frame.pointee.color_range == AVCOL_RANGE_UNSPECIFIED
+            ? AVCOL_RANGE_MPEG : frame.pointee.color_range
         let args = "video_size=\(frame.pointee.width)x\(frame.pointee.height)" +
                    ":pix_fmt=\(frame.pointee.format)" +
                    ":time_base=\(timeBase.num)/\(timeBase.den)" +
                    ":pixel_aspect=\(sarNum)/\(sarDen)" +
-                   ":colorspace=\(frame.pointee.colorspace.rawValue)" +
-                   ":range=\(frame.pointee.color_range.rawValue)"
+                   ":colorspace=\(effectiveColorSpace.rawValue)" +
+                   ":range=\(effectiveRange.rawValue)"
 
         var srcCtx: UnsafeMutablePointer<AVFilterContext>?
         var sinkCtx: UnsafeMutablePointer<AVFilterContext>?
@@ -50,7 +58,17 @@ struct HDRToneMapper {
 
         // BT.2020 PQ/HLG to linear, Hable tone-map to SDR, BT.709 (tv range), RGBA.
         // CGImage does not carry SAR. Bake the same display dimensions as SDR/DV into the pixels.
-        let chain = "zscale=w=\(width):h=\(height):t=linear:npl=100:f=\(highQuality ? "bicubic" : "bilinear")," +
+        var zscaleInputHints = ""
+        if frame.pointee.color_primaries == AVCOL_PRI_UNSPECIFIED {
+            zscaleInputHints += ":pin=bt2020"
+        }
+        if frame.pointee.colorspace == AVCOL_SPC_UNSPECIFIED {
+            zscaleInputHints += ":min=bt2020nc"
+        }
+        if frame.pointee.color_trc == AVCOL_TRC_UNSPECIFIED {
+            zscaleInputHints += ":tin=smpte2084"
+        }
+        let chain = "zscale=w=\(width):h=\(height)\(zscaleInputHints):t=linear:npl=100:f=\(highQuality ? "bicubic" : "bilinear")," +
                     "tonemap=tonemap=hable:desat=0," +
                     "zscale=p=bt709:t=bt709:m=bt709:r=tv," +
                     "format=pix_fmts=rgba"

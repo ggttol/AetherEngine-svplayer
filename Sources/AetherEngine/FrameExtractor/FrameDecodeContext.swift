@@ -71,6 +71,30 @@ final class FrameDecodeContext: @unchecked Sendable {
     private(set) var isDolbyVisionNoBaseLayer = false
     /// Diagnostic/test seam for the decoder selected after the first frame.
     private(set) var hardwareDecoderName: String?
+    // SVPlayer modification (2026-11-25): stream & decode telemetry for redacted thumbnail diagnostics.
+    private(set) var containerName: String = "unknown"
+    private(set) var codecName: String = "unknown"
+    private(set) var profileName: String = "unknown"
+    private(set) var bitDepth: Int = 0
+    private(set) var dvProfile: Int?
+    private(set) var dvCompatID: Int?
+    private(set) var hdrType: String = "unknown"
+    private(set) var lastColorPath: String = "none"
+    private(set) var lastDecodeFailureStage: String?
+    private(set) var lastFFmpegErrorCode: Int32?
+
+    var openDurationSeconds: Double? {
+        guard let demuxer else { return nil }
+        let d = demuxer.duration
+        return (d.isFinite && d > 0) ? d : nil
+    }
+
+    var openStartSeconds: Double {
+        guard let demuxer else { return 0 }
+        let origin = Self.clampOrigin(formatStartTime: demuxer.formatStartTime,
+                                      videoStartSeconds: presentationStartSeconds)
+        return origin.isFinite ? max(0, origin) : 0
+    }
 
     /// Cumulative bytes this context's demuxer pulled from the source (decode-queue only).
     /// Diagnostic: quantifies the extractor's share of link bandwidth per extraction.
@@ -81,23 +105,27 @@ final class FrameDecodeContext: @unchecked Sendable {
         ColorAttachments.isHDRTransfer(trc)
     }
 
+    // SVPlayer modification (2026-11-25): extract Dolby Vision profile and BL compatibility ID.
+    static func dolbyVisionConfig(codecpar: UnsafePointer<AVCodecParameters>) -> (profile: Int, compatID: Int)? {
+        let count = Int(codecpar.pointee.nb_coded_side_data)
+        guard count > 0, let sideData = codecpar.pointee.coded_side_data else { return nil }
+        for i in 0..<count {
+            let item = sideData[i]
+            guard item.type == AV_PKT_DATA_DOVI_CONF, let raw = item.data, item.size >= 8 else { continue }
+            let record = raw.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { $0.pointee }
+            return (Int(record.dv_profile), Int(record.dv_bl_signal_compatibility_id))
+        }
+        return nil
+    }
+
     /// True when the stream is Dolby Vision Profile 5 or 20 (HEVC) or Profile 10.0 (AV1), the
     /// no-base-layer profiles whose decoded planes are IPT-PQ-C2, not standard YCbCr. Read
     /// from the dvcC/dvvC configuration record (`AVDOVIDecoderConfigurationRecord`). Profiles
     /// 7 / 8.x carry HDR10/HLG base layers FFmpeg decodes correctly, so they are excluded.
     static func isDVNoBaseLayer(codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
-        let count = Int(codecpar.pointee.nb_coded_side_data)
-        guard count > 0, let sideData = codecpar.pointee.coded_side_data else { return false }
-        for i in 0..<count {
-            let item = sideData[i]
-            guard item.type == AV_PKT_DATA_DOVI_CONF, let raw = item.data, item.size >= 8 else { continue }
-            let record = raw.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { $0.pointee }
-            let profile = Int(record.dv_profile)
-            let compat = Int(record.dv_bl_signal_compatibility_id)
-            if VideoRoutingPolicy.hevcDolbyVisionHasIPTBase(profile) { return true } // HEVC P5 / P20: IPT-PQ-c2
-            if profile == 10 && compat == 0 { return true } // AV1 P10.0: no base
-            return false
-        }
+        guard let dv = dolbyVisionConfig(codecpar: codecpar) else { return false }
+        if VideoRoutingPolicy.hevcDolbyVisionHasIPTBase(dv.profile) { return true } // HEVC P5 / P20: IPT-PQ-c2
+        if dv.profile == 10 && dv.compatID == 0 { return true } // AV1 P10.0: no base
         return false
     }
 
@@ -193,10 +221,22 @@ final class FrameDecodeContext: @unchecked Sendable {
 
     /// Open demuxer + decoder if not already open. Throws on failure, leaving the
     /// context fully closed (no partial state to leak).
-    func ensureOpen(control: ProbeControl? = nil) throws {
+    func ensureOpen(
+        control: ProbeControl? = nil,
+        chunkSize: Int = 64 * 1024,
+        chunkRequestTimeout: TimeInterval = 2,
+        chunkMaxRetries: Int = 1,
+        boundedWindowBytes: Int? = 64 * 1024
+    ) throws {
         guard !isOpen else { return }
         do {
-            try openInternal(control: control)
+            try openInternal(
+                control: control,
+                chunkSize: chunkSize,
+                chunkRequestTimeout: chunkRequestTimeout,
+                chunkMaxRetries: chunkMaxRetries,
+                boundedWindowBytes: boundedWindowBytes
+            )
             isOpen = true
         } catch {
             close()
@@ -228,7 +268,13 @@ final class FrameDecodeContext: @unchecked Sendable {
         isOpen = false
     }
 
-    private func openInternal(control: ProbeControl?) throws {
+    private func openInternal(
+        control: ProbeControl?,
+        chunkSize: Int = 64 * 1024,
+        chunkRequestTimeout: TimeInterval = 2,
+        chunkMaxRetries: Int = 1,
+        boundedWindowBytes: Int? = 64 * 1024
+    ) throws {
         let demuxer = Demuxer()
         demuxer.probeControl = control
         if let control {
@@ -239,28 +285,57 @@ final class FrameDecodeContext: @unchecked Sendable {
             if let reader {
                 source = reader
             } else if url.isFileURL {
-                guard let file = FileIOReader(regularFile: url) else { throw DemuxerError.openFailed(code: -1) }
+                guard let file = FileIOReader(regularFile: url) else {
+                    lastDecodeFailureStage = "open_file"
+                    throw DemuxerError.openFailed(code: -1)
+                }
                 source = file
                 boundedReader = file
             } else if ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
-                let http = ProbeHTTPReader(url: url, headers: httpHeaders, control: control,
-                                           boundedWindowBytes: 64 * 1024)
+                let http = ProbeHTTPReader(
+                    url: url,
+                    headers: httpHeaders,
+                    control: control,
+                    boundedWindowBytes: boundedWindowBytes,
+                    chunkSize: chunkSize,
+                    chunkRequestTimeout: chunkRequestTimeout,
+                    chunkMaxRetries: chunkMaxRetries
+                )
                 source = http
                 boundedReader = http
             } else {
+                lastDecodeFailureStage = "unsupported_url"
                 throw ProbeError.unsupportedURL
             }
-            // Count from before demux open through seek and decode. The 64 KiB
-            // HTTP window bounds bytes fetched ahead of the input-byte limit.
-            // Register the cancellation handler BEFORE the HTTP open; a stalled
-            // response header must be interruptible by the same deadline.
+            // Count from before demux open through seek and decode.
             let counted = ProbeIOReader(reader: source, control: control)
             try control.check()
-            if let http = source as? ProbeHTTPReader { try http.open() }
+            if let http = source as? ProbeHTTPReader {
+                do {
+                    try http.open()
+                } catch {
+                    lastDecodeFailureStage = "open_http"
+                    if case AVIOReaderError.httpStatus(let code) = error {
+                        lastFFmpegErrorCode = Int32(code)
+                    }
+                    throw error
+                }
+            }
             try control.check()
-            try demuxer.open(reader: counted,
-                             formatHint: formatHint, profile: .stillExtraction,
-                             selectTitleID: selectTitleID)
+            do {
+                try demuxer.open(reader: counted,
+                                 formatHint: formatHint, profile: .stillExtraction,
+                                 selectTitleID: selectTitleID)
+            } catch {
+                lastDecodeFailureStage = "open_demuxer"
+                if case DemuxerError.openFailed(let code) = error {
+                    lastFFmpegErrorCode = code
+                } else if case DemuxerError.streamInfoFailed(let code) = error {
+                    lastDecodeFailureStage = "find_stream_info"
+                    lastFFmpegErrorCode = code
+                }
+                throw error
+            }
             try control.check()
         } else if let reader = reader {
             try demuxer.open(reader: reader, formatHint: formatHint, profile: .stillExtraction)
@@ -283,8 +358,10 @@ final class FrameDecodeContext: @unchecked Sendable {
 
     private func configureDecoder(for demuxer: Demuxer) throws {
         self.demuxer = demuxer
+        containerName = demuxer.containerFormatName ?? "unknown"
         let videoIdx = demuxer.videoStreamIndex
         guard videoIdx >= 0, let stream = demuxer.stream(at: videoIdx) else {
+            lastDecodeFailureStage = "no_video_stream"
             throw FrameDecodeError.noVideoStream
         }
         videoStreamIndex = videoIdx
@@ -295,13 +372,11 @@ final class FrameDecodeContext: @unchecked Sendable {
         demuxer.discardAllStreamsExcept([videoIdx])
 
         guard let codecpar = stream.pointee.codecpar else {
+            lastDecodeFailureStage = "no_codec_params"
             throw FrameDecodeError.noCodecParameters
         }
         // Prefer container/stream SAR; the SW decoder does not reliably attach SAR
         // to output frames (see SoftwareVideoDecoder), so per-frame is fallback-only.
-        // Both fields: codecpar holds the bitstream-declared ratio, while a container-declared one
-        // (Matroska DisplayWidth, MP4 pasp) reaches AVStream alone. Resolved by the shared rule, so
-        // a thumbnail cannot be shaped by a different ratio than the playing picture.
         let declared = SoftwareVideoDecoder.declaredStreamSAR(
             bitstream: codecpar.pointee.sample_aspect_ratio,
             container: stream.pointee.sample_aspect_ratio
@@ -310,11 +385,62 @@ final class FrameDecodeContext: @unchecked Sendable {
             streamSAR = declared
         }
         containerColor = ColorDescription(codecpar: codecpar)
-        isHDR = Self.isHDRTransfer(codecpar.pointee.color_trc)
+        let dv = Self.dolbyVisionConfig(codecpar: codecpar)
+        dvProfile = dv?.profile
+        dvCompatID = dv?.compatID
+        // SVPlayer modification (2026-11-25): DV Profile 7 and Profile 8.1/8.4 carry
+        // HDR10/HLG base layers even if container VUI left color_trc unspecified.
+        if let dv {
+            if dv.profile == 7 || (dv.profile == 8 && dv.compatID == 1) {
+                if containerColor.transfer == AVCOL_TRC_UNSPECIFIED {
+                    containerColor.transfer = AVCOL_TRC_SMPTE2084
+                }
+                if containerColor.primaries == AVCOL_PRI_UNSPECIFIED {
+                    containerColor.primaries = AVCOL_PRI_BT2020
+                }
+                if containerColor.matrix == AVCOL_SPC_UNSPECIFIED {
+                    containerColor.matrix = AVCOL_SPC_BT2020_NCL
+                }
+            } else if dv.profile == 8 && dv.compatID == 4 {
+                if containerColor.transfer == AVCOL_TRC_UNSPECIFIED {
+                    containerColor.transfer = AVCOL_TRC_ARIB_STD_B67
+                }
+                if containerColor.primaries == AVCOL_PRI_UNSPECIFIED {
+                    containerColor.primaries = AVCOL_PRI_BT2020
+                }
+                if containerColor.matrix == AVCOL_SPC_UNSPECIFIED {
+                    containerColor.matrix = AVCOL_SPC_BT2020_NCL
+                }
+            }
+        }
+        isHDR = Self.isHDRTransfer(containerColor.transfer)
         isDolbyVisionNoBaseLayer = Self.isDVNoBaseLayer(codecpar: codecpar)
+
+        if let dv {
+            hdrType = "dv_p\(dv.profile)"
+        } else if containerColor.transfer == AVCOL_TRC_SMPTE2084 {
+            hdrType = "hdr10"
+        } else if containerColor.transfer == AVCOL_TRC_ARIB_STD_B67 {
+            hdrType = "hlg"
+        } else {
+            hdrType = "sdr"
+        }
+        let pixFmt = AVPixelFormat(rawValue: codecpar.pointee.format)
+        if pixFmt != AV_PIX_FMT_NONE, let desc = av_pix_fmt_desc_get(pixFmt), desc.pointee.nb_components > 0 {
+            bitDepth = Int(desc.pointee.comp.0.depth)
+        } else {
+            bitDepth = max(8, Int(codecpar.pointee.bits_per_raw_sample))
+        }
+        if let profileC = avcodec_profile_name(codecpar.pointee.codec_id, codecpar.pointee.profile) {
+            profileName = String(cString: profileC)
+        } else {
+            profileName = "unknown"
+        }
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
+            lastDecodeFailureStage = "unsupported_codec"
             throw FrameDecodeError.unsupportedCodec
         }
+        codecName = codec.pointee.name.map { String(cString: $0) } ?? "unknown"
         var openedWithHardware = false
         if Self.stillUsesHardware(allows: allowsHardwareDecode, disabled: hardwareDecodeDisabled,
                                   dvNoBaseLayer: isDolbyVisionNoBaseLayer) {
@@ -462,12 +588,19 @@ final class FrameDecodeContext: @unchecked Sendable {
         reportResidentTime: ((Double, Bool) -> Void)? = nil,
         residentDeadline: ContinuousClock.Instant? = nil,
         reportDecodedTime: ((Double?) -> Void)? = nil,
-        bounded: Bool = false
+        bounded: Bool = false,
+        skipSeek: Bool = false
     ) -> CGImage? {
-        guard isOpen, let ctx = codecContext, let demuxer else { return nil }
-        // Without the reshaping these planes are IPT, which the standard path would read as YCbCr
+        guard isOpen, let ctx = codecContext, let demuxer else {
+            lastDecodeFailureStage = "context_not_open"
+            return nil
+        }
+        // Without the reshaping trait these planes are IPT, which the standard path would read as YCbCr
         // (the green / magenta still of #103): no still at all, and nothing read or decoded for it.
-        guard Self.yieldsStill(dolbyVisionNoBaseLayer: isDolbyVisionNoBaseLayer) else { return nil }
+        guard Self.yieldsStill(dolbyVisionNoBaseLayer: isDolbyVisionNoBaseLayer) else {
+            lastDecodeFailureStage = "dv_p5_unsupported"
+            return nil
+        }
 
         // Full reconstruction matters for previews and snapshots; only coarse keyframe
         // thumbnails opt into skipped loop filtering and the codec's inaccurate fast path.
@@ -513,7 +646,9 @@ final class FrameDecodeContext: @unchecked Sendable {
         if let residentTarget, mode == .snapshot {
             guard let start = presentationStartSeconds, abs(residentTarget - start) <= 12 else { return nil }
         }
-        demuxer.seek(to: residentTarget == nil ? seekSeconds : 0)
+        if !skipSeek {
+            _ = demuxer.seek(to: residentTarget == nil ? seekSeconds : 0)
+        }
 
         // A resident frame is compared on its source PTS axis, including any nonzero segment origin.
         // A target the stream's own time base cannot hold is no position in it (audit BIT-105).
@@ -581,6 +716,7 @@ final class FrameDecodeContext: @unchecked Sendable {
             #if DolbyVisionStillReshaping
             if isDolbyVisionNoBaseLayer {
                 if let img = DolbyVisionStillConverter.makeImage(frame: f, targetWidth: width, sar: sar) {
+                    lastColorPath = "dv_reshaped"
                     return img
                 }
                 // No DV metadata on this frame / unsupported layout: fall through to the standard path.
@@ -591,11 +727,19 @@ final class FrameDecodeContext: @unchecked Sendable {
                                                  sar: sar, highQuality: mode.isFrameAccurate)
                 if toned != nil {
                     defer { av_frame_free(&toned) }
-                    if let img = Self.cgImageFromRGBAFrame(toned!) { return img }
+                    if let img = Self.cgImageFromRGBAFrame(toned!) {
+                        lastColorPath = "hdr_tonemap"
+                        return img
+                    }
                 }
                 // tone-map failed: fall through to sws path (degraded but non-nil)
             }
-            return convertToCGImage(frame: f, targetWidth: width, highQuality: mode.isFrameAccurate)
+            if let img = convertToCGImage(frame: f, targetWidth: width, highQuality: mode.isFrameAccurate) {
+                lastColorPath = "sws_sdr"
+                return img
+            }
+            lastDecodeFailureStage = "color_convert"
+            return nil
         }
 
         // Once the demuxer hits EOF, flush the decoder (NULL packet) and keep draining: the
@@ -611,6 +755,7 @@ final class FrameDecodeContext: @unchecked Sendable {
                 do {
                     packetOrNil = try demuxer.readPacket()
                 } catch {
+                    lastDecodeFailureStage = "read_packet"
                     return nil
                 }
                 guard let packet = packetOrNil else {
@@ -628,19 +773,32 @@ final class FrameDecodeContext: @unchecked Sendable {
                 let sendRet = avcodec_send_packet(ctx, packet)
                 av_packet_unref(packet)
                 av_packet_free_safe(packet)
-                guard sendRet >= 0 else { continue }
+                if sendRet < 0 {
+                    lastFFmpegErrorCode = sendRet
+                    continue
+                }
             }
 
             while true {
                 if isCancelled() { return nil }
                 let recvRet = avcodec_receive_frame(ctx, frame)
                 if recvRet == FFmpegErr.eagain {
-                    if draining { return nil }      // flushed dry without reaching the target
+                    if draining {
+                        lastDecodeFailureStage = "decoder_eof_no_frame"
+                        return nil
+                    }
                     break                           // need another packet
                 }
-                if recvRet == FFmpegErr.eof { return nil } // decoder drained
+                if recvRet == FFmpegErr.eof {
+                    lastDecodeFailureStage = "decoder_eof_no_frame"
+                    return nil
+                }
                 guard recvRet >= 0, let f = frame else {
-                    if draining { return nil }      // avoid re-flushing the same error forever
+                    lastFFmpegErrorCode = recvRet
+                    if draining {
+                        lastDecodeFailureStage = "decode_frame"
+                        return nil
+                    }
                     break                           // real error: try next packet
                 }
 
@@ -871,6 +1029,51 @@ final class FrameDecodeContext: @unchecked Sendable {
             space: colorSpace, bitmapInfo: bitmapInfo,
             provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent
         )
+    }
+
+    // SVPlayer modification (2026-11-25): fast 16x16 center-region luminance check to
+    // detect opening black/fade-in frames so thumbnail extraction can try another keyframe.
+    static func isMostlyBlack(_ image: CGImage) -> Bool {
+        let w = image.width
+        let h = image.height
+        guard w >= 4, h >= 4 else { return false }
+        let sampleW = 16
+        let sampleH = 16
+        var pixels = [UInt8](repeating: 0, count: sampleW * sampleH * 4)
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                data: &pixels,
+                width: sampleW,
+                height: sampleH,
+                bitsPerComponent: 8,
+                bytesPerRow: sampleW * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            return false
+        }
+        ctx.interpolationQuality = .low
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: sampleW, height: sampleH))
+
+        var lumas: [Double] = []
+        lumas.reserveCapacity(144)
+        var sum = 0.0
+        for y in 2..<(sampleH - 2) {
+            for x in 2..<(sampleW - 2) {
+                let idx = (y * sampleW + x) * 4
+                let r = Double(pixels[idx])
+                let g = Double(pixels[idx + 1])
+                let b = Double(pixels[idx + 2])
+                let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                lumas.append(luma)
+                sum += luma
+            }
+        }
+        guard !lumas.isEmpty else { return false }
+        lumas.sort()
+        let mean = sum / Double(lumas.count)
+        let p95 = lumas[min(lumas.count - 1, Int(Double(lumas.count) * 0.95))]
+        return mean < 12.0 && p95 < 24.0
     }
 }
 

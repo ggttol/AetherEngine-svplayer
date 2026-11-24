@@ -210,6 +210,20 @@ final class ProbeControl: @unchecked Sendable {
         limits.map { limits in lock.withLock { max(0, limits.maxInputBytes - inputBytes) } }
     }
 
+    // SVPlayer modification (2026-11-25): expose read-only counters and typed stop
+    // reason for thumbnail extraction diagnostics without changing probe behavior.
+    var consumedInputBytes: Int64 {
+        lock.withLock { inputBytes }
+    }
+
+    var consumedPacketCount: Int {
+        lock.withLock { packets }
+    }
+
+    var recordedFailure: (any Error)? {
+        lock.withLock { failure }
+    }
+
     func inputAllowance(_ requested: Int32) throws -> Int32 {
         try check()
         guard let limits else { return requested }

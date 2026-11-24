@@ -94,3 +94,67 @@ public enum FrameMode: Sendable, Hashable {
         !isFrameAccurate || framePTS == Int64.min || framePTS >= targetPTS
     }
 }
+
+// SVPlayer modification (2026-11-25): structured redacted telemetry and outcome
+// types for directory video thumbnail extraction across SDR/HDR/DV/MKV/TS/SMB.
+public struct ThumbnailExtractionDiagnostics: Sendable, Equatable {
+    public let container: String
+    public let codec: String
+    public let profile: String
+    public let bitDepth: Int
+    public let hdrType: String
+    public let dvProfile: Int?
+    public let durationSeconds: Double?
+    public let seekSeconds: Double
+    public let actualSeconds: Double?
+    public let bytesRead: Int64
+    public let packetsRead: Int
+    public let colorPath: String
+    public let failureStage: String?
+    public let ffmpegErrorCode: Int32?
+    public let detail: String?
+
+    public init(
+        container: String = "unknown",
+        codec: String = "unknown",
+        profile: String = "unknown",
+        bitDepth: Int = 0,
+        hdrType: String = "unknown",
+        dvProfile: Int? = nil,
+        durationSeconds: Double? = nil,
+        seekSeconds: Double = 0,
+        actualSeconds: Double? = nil,
+        bytesRead: Int64 = 0,
+        packetsRead: Int = 0,
+        colorPath: String = "none",
+        failureStage: String? = nil,
+        ffmpegErrorCode: Int32? = nil,
+        detail: String? = nil
+    ) {
+        self.container = container
+        self.codec = codec
+        self.profile = profile
+        self.bitDepth = bitDepth
+        self.hdrType = hdrType
+        self.dvProfile = dvProfile
+        self.durationSeconds = durationSeconds
+        self.seekSeconds = seekSeconds
+        self.actualSeconds = actualSeconds
+        self.bytesRead = bytesRead
+        self.packetsRead = packetsRead
+        self.colorPath = colorPath
+        self.failureStage = failureStage
+        self.ffmpegErrorCode = ffmpegErrorCode
+        self.detail = detail
+    }
+}
+
+public struct ThumbnailExtractionOutcome: @unchecked Sendable {
+    public let image: CGImage?
+    public let diagnostics: ThumbnailExtractionDiagnostics
+
+    public init(image: CGImage?, diagnostics: ThumbnailExtractionDiagnostics) {
+        self.image = image
+        self.diagnostics = diagnostics
+    }
+}

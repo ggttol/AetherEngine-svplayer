@@ -5192,6 +5192,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     private func probeFileSize() -> Int64 {
         if let probeControl {
+            // SVPlayer modification (2026-11-25): on loopback LocalStreamProxyServer
+            // URLs (SMB/NFS/FTP/SFTP), HEAD resolves Content-Length in <1ms without
+            // opening an upstream file reader and cancelling it mid-transfer.
+            let hostLower = url.host?.lowercased()
+            let isLoopback = hostLower == "127.0.0.1" || hostLower == "::1" || hostLower == "localhost"
+            if isLoopback {
+                let head = headProbeFileSize()
+                if head > 0 { return head }
+                guard !probeControl.isStopped else { return -1 }
+                if let size = rangeProbeFileSize(range: "bytes=0-1"), size > 0 { return size }
+                guard !probeControl.isStopped else { return -1 }
+                return rangeProbeFileSize(range: "bytes=0-") ?? -1
+            }
             // Disposable probes retain their own cancellation and lifetime contract.
             if let size = rangeProbeFileSize(range: "bytes=0-"), size > 0 { return size }
             guard !probeControl.isStopped else { return -1 }
