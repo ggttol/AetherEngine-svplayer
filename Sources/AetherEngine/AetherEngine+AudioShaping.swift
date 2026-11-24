@@ -83,13 +83,21 @@ extension AetherEngine {
             return
         }
         audioShapingReanchorInFlight = true
+        // SVPlayer modification (2026-11-24): Preserve the session's play intent across multi-pass
+        // audio-shaping reloads so rapid volume-boost transitions never lose playIntent between
+        // iterations, while still honoring any explicit user play()/pause() recorded during reload.
+        let initialWantsPlay = sessionRebuildResumesPlaying
         Task { @MainActor in
             defer { self.audioShapingReanchorInFlight = false }
             var delivered: AudioShaping
+            var desiredPlay = initialWantsPlay
             repeat {
                 delivered = self.loadedOptions.audioShaping
                 do {
-                    try await self.reloadAtCurrentPosition()
+                    try await self.reloadAtCurrentPosition(autoplay: desiredPlay)
+                    if let updatedIntent = self.transportIntentUnderReconstruction {
+                        desiredPlay = updatedIntent
+                    }
                     EngineLog.emit("[AetherEngine] AE#923: rebuilt at the playhead with audio shaping "
                                    + delivered.summary, category: .engine)
                 } catch is CancellationError {

@@ -10,9 +10,11 @@ import AetherLibavformat
     public let isSeekable: Bool
     private let loader: Loader
 
-    public init(url: URL, seconds: Double, userAgent: String?, deadline: DispatchTime,
+    // SVPlayer modification (2026-11-24): Forward session HTTP headers to FrameCaptureInput so
+    // authenticated direct streams (e.g. WebDAV/Emby) capture fallback stills without LocalStreamProxyServer.
+    public init(url: URL, seconds: Double, userAgent: String?, httpHeaders: [String: String] = [:], deadline: DispatchTime,
                 cancellation: ProbeCancellation, configuration: URLSessionConfiguration = .ephemeral) throws {
-        let loader = try Loader(url: url, userAgent: userAgent, deadline: deadline,
+        let loader = try Loader(url: url, userAgent: userAgent, extraHeaders: httpHeaders, deadline: deadline,
                                 cancellation: cancellation, configuration: configuration)
         let input = try loader.resolve(seconds: seconds.isFinite ? max(0, seconds) : 0)
         self.loader = loader
@@ -118,13 +120,18 @@ import AetherLibavformat
         let session: URLSession
         var resources: [Resource] = []
 
-        init(url: URL, userAgent: String?, deadline: DispatchTime,
+        init(url: URL, userAgent: String?, extraHeaders: [String: String] = [:], deadline: DispatchTime,
              cancellation: ProbeCancellation, configuration: URLSessionConfiguration) throws {
             guard var components = URLComponents(url: url, resolvingAgainstBaseURL: true),
                   let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
                   components.host != nil else { throw ProbeError.unsupportedURL }
-            var headers = ["Accept-Encoding": "identity",
-                           "User-Agent": userAgent.flatMap { $0.isEmpty ? nil : $0 } ?? "SVPlayer-FrameCapture"]
+            var headers = extraHeaders
+            headers["Accept-Encoding"] = "identity"
+            if let ua = userAgent, !ua.isEmpty {
+                headers["User-Agent"] = ua
+            } else if headers["User-Agent"] == nil && headers["user-agent"] == nil {
+                headers["User-Agent"] = "SVPlayer-FrameCapture"
+            }
             if let user = components.user {
                 headers["Authorization"] = "Basic " + Data("\(user):\(components.password ?? "")".utf8).base64EncodedString()
                 components.user = nil

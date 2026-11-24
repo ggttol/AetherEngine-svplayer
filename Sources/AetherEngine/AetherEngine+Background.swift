@@ -218,6 +218,17 @@ extension AetherEngine {
         if returnedFromBackground { Self.clearPanelRefusalOnForegroundReturn() }
         backgroundActionOwed = false
         noteVideoPresentationToHost()
+        syncForegroundPausedPrefetchExpansion()
+    }
+
+    // SVPlayer modification (2026-11-24): Allow macOS/host controllers to report background transitions
+    // so foreground-paused prefetch expansion halts cleanly when the app leaves the foreground.
+    public func setHostBackgrounded(_ inBackground: Bool) {
+        if inBackground {
+            noteDidEnterBackground()
+        } else {
+            noteForegroundActive()
+        }
     }
 
     // MARK: Owed background decision (audit CORE-2, LIF-101)
@@ -288,6 +299,7 @@ extension AetherEngine {
         isBackgrounded = true
         backgroundActionOwed = backgroundDecisionMustWait
         noteVideoPresentationToHost()
+        syncForegroundPausedPrefetchExpansion()
     }
 
     /// Tells the software host whether a refused video rebuild may be retried now. A backgrounded app with

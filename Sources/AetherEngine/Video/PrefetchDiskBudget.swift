@@ -19,6 +19,15 @@ enum PrefetchDiskBudget {
     /// a full volume for a stall. A pathologically small budget therefore loses to playback, by design.
     static let minAheadSegments = 10
 
+    // SVPlayer modification (2026-11-24): Seconds-based forward buffer floor and 70% park/resume hysteresis.
+    /// Default Wi-Fi minimum forward duration (seconds) before disk-budget parking engages.
+    static let defaultMinAheadSeconds: Double = 60.0
+    /// Minimum playback safety cushion (seconds) enforced even when a hard disk cap is hit.
+    static let safetyFloorSeconds: Double = 20.0
+    /// Default hysteresis resume ratio: once parked at 100% of target, resume prefetching when
+    /// buffered bytes or buffered seconds fall to or below 70% of target rather than draining near empty.
+    static let defaultHysteresisResumeRatio: Double = 0.70
+
     /// - Parameters:
     ///   - forwardBytes: on-disk bytes at or above the consumer's target (`SegmentCache.forwardBytes`),
     ///     i.e. what the producer's race-ahead owns. History behind the playhead is excluded: the
@@ -33,5 +42,63 @@ enum PrefetchDiskBudget {
                            minAheadSegments: Int = minAheadSegments) -> Bool {
         guard budgetBytes > 0, forwardBytes >= budgetBytes else { return false }
         return head - consumerTarget >= minAheadSegments
+    }
+
+    // SVPlayer modification (2026-11-24): Seconds-based disk-budget park with park/resume hysteresis.
+    /// Evaluates whether the producer should park on the on-disk forward byte budget using real buffered
+    /// duration (`aheadSeconds`) instead of a fixed segment count, with hysteresis (`resumeRatio`).
+    static func shouldPark(forwardBytes: Int,
+                           budgetBytes: Int,
+                           aheadSeconds: Double,
+                           minAheadSeconds: Double = defaultMinAheadSeconds,
+                           currentlyParked: Bool,
+                           resumeRatio: Double = defaultHysteresisResumeRatio,
+                           hardCeilingBytes: Int? = nil) -> Bool {
+        guard budgetBytes > 0 else { return false }
+        let effectiveBudget = hardCeilingBytes.map { min(budgetBytes, $0) } ?? budgetBytes
+        guard effectiveBudget > 0 else { return false }
+        let clampedRatio = min(0.95, max(0.30, resumeRatio))
+        let resumeBudget = Int(Double(effectiveBudget) * clampedRatio)
+        let effectiveMinAhead: Double = {
+            if let hardCeilingBytes, forwardBytes >= hardCeilingBytes {
+                return min(minAheadSeconds, safetyFloorSeconds)
+            }
+            return minAheadSeconds
+        }()
+        let resumeAheadSeconds = effectiveMinAhead * clampedRatio
+
+        if currentlyParked {
+            if aheadSeconds <= resumeAheadSeconds { return false }
+            return forwardBytes > resumeBudget
+        } else {
+            return forwardBytes >= effectiveBudget && aheadSeconds >= effectiveMinAhead
+        }
+    }
+
+    // SVPlayer modification (2026-11-24): Seconds-based forward window park with 70% hysteresis.
+    /// Evaluates whether the producer should park on the forward time/segment window, staying parked
+    /// after hitting 100% until buffered headroom drains to `resumeRatio` (default 70%) so prefetch
+    /// refills in smooth contiguous bursts rather than waking on every single segment boundary.
+    static func shouldParkWindow(aheadSeconds: Double,
+                                 targetSeconds: Double,
+                                 aheadSegments: Int,
+                                 windowSegments: Int,
+                                 currentlyParked: Bool,
+                                 resumeRatio: Double = defaultHysteresisResumeRatio) -> Bool {
+        let clampedRatio = min(0.95, max(0.30, resumeRatio))
+        if targetSeconds > 0 {
+            let resumeSeconds = targetSeconds * clampedRatio
+            if currentlyParked {
+                return aheadSeconds > resumeSeconds
+            } else {
+                return aheadSeconds >= targetSeconds
+            }
+        }
+        let resumeSegments = max(4, Int(floor(Double(windowSegments) * clampedRatio)))
+        if currentlyParked {
+            return aheadSegments > resumeSegments
+        } else {
+            return aheadSegments >= windowSegments
+        }
     }
 }

@@ -2381,6 +2381,9 @@ public final class AetherEngine: ObservableObject {
                     guard let self, let session, self.nativeVideoSession === session else { return }
                     self.residentPlaylistRanges = ranges
                     self.republishResidentRanges()
+                    // SVPlayer modification (2026-11-24): Update bufferedPosition immediately when disk
+                    // residency changes so the scrub bar tracks buffered growth while paused.
+                    self.refreshNativeBufferedPosition()
                 }
             }
             residentPlaylistRanges = []
@@ -4355,6 +4358,22 @@ public final class AetherEngine: ObservableObject {
     /// AE#923: the same latch for `setAudioShaping`'s rebuilds.
     var audioShapingReanchorInFlight = false
 
+    // SVPlayer modification (2026-11-24): Expose active in-place session rebuild state so host controllers
+    // preserve play/pause UI and transport intent during audio-shaping / delay / option reloads.
+    public var isSessionPreservingReloadInFlight: Bool {
+        sessionPreservingReloadInFlight || audioShapingReanchorInFlight || audioDelayReanchorInFlight
+    }
+
+    // SVPlayer modification (2026-11-24): Expand VOD prefetch to the platform disk ceiling while paused
+    // in the foreground (on Wi-Fi/Ethernet); revert to normal target on play() or entering background.
+    func syncForegroundPausedPrefetchExpansion() {
+        let expanded = !isBackgrounded
+            && !loadedOptions.isLive
+            && loadedOptions.pausedForegroundCacheByteBudget != nil
+            && (state == .paused || (nativeHost?.transportIntentIsPlaying == false && state != .idle && state != .loading))
+        nativeVideoSession?.setForegroundPausedPrefetchExpanded(expanded)
+    }
+
     /// The playhead a rebuild of this session has to come back to (#464 round 2).
     var positionForSessionRebuild: Double {
         let pending = !isLive && nativeHost != nil
@@ -5643,15 +5662,25 @@ public final class AetherEngine: ObservableObject {
                     FLACStreamInfo.coreMediaMistimesFrames(UnsafePointer($0.pointee.codecpar), frameBlockSize: size)
                 } ?? false
             } ?? false
-            let useNativeAudio = Self.audioOnlyUsesAVPlayer(
+            let baseUseNativeAudio = Self.audioOnlyUsesAVPlayer(
                 codecID: audioCodecID, isCustomSource: isCustomSource,
                 flacBlocksTooSmall: flacBlocksTooSmall, flacFramesMistimed: flacFramesMistimed,
                 flacSeeksMisplaced: flacSeeksMisplaced, aacLayoutInPCE: aacLayoutInPCE,
                 containerUnreadable: containerUnreadable,
                 preferred: options.preferredDecodePath)
+            // SVPlayer modification (2026-11-24): Route audio-only streams on self-signed HTTPS origins to
+            // AudioPlaybackHost (FFmpeg + AVIOReader + EngineTLS) because AVURLAsset ignores EngineTLS.
+            let audioOriginRefusedBySystemTrust: Bool
+            if baseUseNativeAudio, EngineTLS.serverTrustEvaluator != nil, url.scheme?.lowercased() == "https" {
+                audioOriginRefusedBySystemTrust = await HLSOriginRelay.systemTrustRefuses(url, headers: options.httpHeaders)
+                try checkLoadCurrent(gen)
+            } else {
+                audioOriginRefusedBySystemTrust = false
+            }
+            let useNativeAudio = baseUseNativeAudio && !audioOriginRefusedBySystemTrust
             // Named only when it decided the route (AVPlayer otherwise), so a host can tell its
             // preference arrived.
-            let hostAskedSoftware = !useNativeAudio && Self.audioOnlyUsesAVPlayer(
+            let hostAskedSoftware = !useNativeAudio && !audioOriginRefusedBySystemTrust && Self.audioOnlyUsesAVPlayer(
                 codecID: audioCodecID, isCustomSource: isCustomSource,
                 flacBlocksTooSmall: flacBlocksTooSmall, flacFramesMistimed: flacFramesMistimed,
                 flacSeeksMisplaced: flacSeeksMisplaced, aacLayoutInPCE: aacLayoutInPCE,
@@ -6670,6 +6699,7 @@ public final class AetherEngine: ObservableObject {
                     // reports a rejection, so the gate above cannot see it. Watch the clock instead.
                     armAirPlayProgressWatchdog(gen: gen, position: startPosition ?? 0)
                 }
+                syncForegroundPausedPrefetchExpansion()
                 startMemoryProbe()
                 startLiveTelemetrySampler()
                 armDisplayModeDiagnostic(gen: gen, backend: "native",
@@ -6770,6 +6800,7 @@ public final class AetherEngine: ObservableObject {
         // renderer without a state change; the Atmos output activator follows the renderer, so tell it.
         atmosOutputActivator?.refresh()
         clampLiveResumeIfBehindWindow()
+        syncForegroundPausedPrefetchExpansion()
     }
 
     public func pause() {
@@ -6787,6 +6818,7 @@ public final class AetherEngine: ObservableObject {
         } else {
             requestBackgroundDecision(.paused)
         }
+        syncForegroundPausedPrefetchExpansion()
     }
 
     public func togglePlayPause() {

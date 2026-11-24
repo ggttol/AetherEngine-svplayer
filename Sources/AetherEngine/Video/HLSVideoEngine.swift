@@ -1227,6 +1227,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         heldSourceConnection: Bool = false,
         declaredDurationSeconds: Double? = nil,
         forwardBufferSegments: Int? = nil,
+        targetForwardBufferSeconds: Double? = nil,
+        minAheadBufferSeconds: Double? = nil,
+        pausedForegroundCacheByteBudget: Int? = nil,
+        autoSizeSessionCacheFromBitrate: Bool = false,
         sessionCacheByteBudget: Int? = nil,
         sessionCacheHardLimitBytes: Int? = nil,
         sessionCacheFreeReserveBytes: Int = 0
@@ -1305,6 +1309,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.companionAudioReader = companionAudioReader
         self.liveSourceAnnouncesDiscontinuities = liveSourceAnnouncesDiscontinuities
         self.forwardWindowSegments = Self.clampedForwardWindow(forwardBufferSegments)
+        self.requestedTargetForwardBufferSeconds = targetForwardBufferSeconds
+        self.requestedMinAheadBufferSeconds = minAheadBufferSeconds
+        self.requestedPausedForegroundCacheBudgetBytes = pausedForegroundCacheByteBudget.map { max(0, $0) }
+        self.autoSizeSessionCacheFromBitrate = autoSizeSessionCacheFromBitrate
         self.requestedSessionCacheBudgetBytes = sessionCacheByteBudget.map { max(0, $0) }
         self.sessionCacheHardLimitBytes = sessionCacheHardLimitBytes
         self.sessionCacheFreeReserveBytes = max(0, sessionCacheFreeReserveBytes)
@@ -1314,19 +1322,48 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// (`HLSSegmentProducer.bufferAheadSegments`) and the cache's forward window
     /// (`SegmentCache.forwardWindow`); the two MUST stay identical (a drift is exactly what stalls
     /// AVPlayer, see `SegmentCache`). From `LoadOptions.forwardBufferSegments`; nil -> historical 10.
-    let forwardWindowSegments: Int
+    // SVPlayer modification (2026-11-24): Refined in `prepare()` from the real segment plan when
+    // `targetForwardBufferSeconds` is configured, before constructing `SegmentCache` and `HLSSegmentProducer`.
+    private(set) var forwardWindowSegments: Int
 
     /// Session retention budget resolved in `start()`; also bounds the producer's race-ahead on disk
     /// (#207, see `PrefetchDiskBudget`). Live resolves the same budget, so the DVR history the
     /// playlist advertises stays resident; the producer-side prefetch park it also feeds is
     /// VOD-only (`advanceMuxer`), so live cannot park on it.
     private var retentionBudgetBytes: Int = 0
+    private let requestedTargetForwardBufferSeconds: Double?
+    private let requestedMinAheadBufferSeconds: Double?
+    private let requestedPausedForegroundCacheBudgetBytes: Int?
+    private let autoSizeSessionCacheFromBitrate: Bool
+    private var resolvedPlayingPrefetchBudgetBytes: Int = 0
+    private var resolvedPausedPrefetchBudgetBytes: Int = 0
+    private var resolvedHardDiskCeilingBytes: Int = 0
+    private let foregroundPausedPrefetchExpandedFlag = OSAllocatedUnfairLock(initialState: false)
     private let requestedSessionCacheBudgetBytes: Int?
     private let sessionCacheHardLimitBytes: Int?
     private let sessionCacheFreeReserveBytes: Int
     private var sessionCacheVolumeSafetyLimitBytes: Int?
     /// The clamped request the status reports; `retentionBudgetBytes` is what is enforced.
     private var sessionCacheBaseEffectiveBytes: Int = 0
+
+    // SVPlayer modification (2026-11-24): Toggle foreground-paused disk fill expansion and immediately wake
+    // any parked producer so paused buffering fills up to the platform disk ceiling (2 GB / 1 GB / 1/4 free).
+    func setForegroundPausedPrefetchExpanded(_ expanded: Bool) {
+        let changed = foregroundPausedPrefetchExpandedFlag.withLock { flag -> Bool in
+            defer { flag = expanded }
+            return flag != expanded
+        }
+        guard changed else { return }
+        if !isLiveSession {
+            EngineLog.emit(
+                "[HLSVideoEngine] foreground paused prefetch expansion -> \(expanded ? "on" : "off") "
+                + "(playing=\(resolvedPlayingPrefetchBudgetBytes / (1 << 20)) MiB, "
+                + "paused=\(resolvedPausedPrefetchBudgetBytes / (1 << 20)) MiB)",
+                category: .session
+            )
+            subsystemSnapshot().cache?.wakeWaiters()
+        }
+    }
 
     /// Lifecycle snapshots, including async close completion, are delivered here. The host may
     /// sample `sessionCacheStatus()` for current bytes; this callback is primarily for cleanup.
@@ -2014,12 +2051,55 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage
         #endif
+        // SVPlayer modification (2026-11-24): Refine forwardWindowSegments from real segment durations when
+        // seconds-based adaptive prefetch is active, and size playing vs foreground-paused disk ceilings
+        // (iOS/iPadOS/macOS 2 GB, tvOS 1 GB, <= 1/4 available volume space).
+        if !isLiveSession, let targetSec = requestedTargetForwardBufferSeconds, targetSec > 0, !plan.isEmpty {
+            let avgSegDuration = max(1.0, durationSeconds / Double(plan.count))
+            let targetSegs = Int(ceil(targetSec / avgSegDuration))
+            forwardWindowSegments = Self.clampedForwardWindow(max(forwardWindowSegments, targetSegs))
+        }
+        #if os(tvOS)
+        let platformDiskCeilingBytes = 1024 * 1_048_576
+        #else
+        let platformDiskCeilingBytes = 2048 * 1_048_576
+        #endif
+        let quarterOfFreeBytes: Int = availableBytes.map { available in
+            let quarter = max(Int64(0), available / 4)
+            return Int(min(quarter, Int64(Int.max)))
+        } ?? platformDiskCeilingBytes
+        let hardDiskCeiling = min(platformDiskCeilingBytes, quarterOfFreeBytes)
+
+        var effectivePlayingBytes: Int? = isLiveSession ? nil : requestedSessionCacheBudgetBytes
+        if !isLiveSession, autoSizeSessionCacheFromBitrate {
+            let targetSec = max(60.0, requestedTargetForwardBufferSeconds ?? 120.0)
+            let floorSec = max(20.0, requestedMinAheadBufferSeconds ?? 60.0)
+            if sourceBitrate > 0 {
+                let targetBytes = Int(ceil(Double(sourceBitrate) / 8.0 * targetSec * 1.10))
+                let floorBytes = Int(ceil(Double(sourceBitrate) / 8.0 * floorSec * 1.10))
+                let minimumRetention = 128 * 1_048_576
+                let computed = min(hardDiskCeiling, max(minimumRetention, max(floorBytes, targetBytes)))
+                effectivePlayingBytes = effectivePlayingBytes.map { min(hardDiskCeiling, max($0, computed)) } ?? computed
+            } else if effectivePlayingBytes == nil {
+                effectivePlayingBytes = min(hardDiskCeiling, 512 * 1_048_576)
+            }
+        } else if !isLiveSession, let req = effectivePlayingBytes {
+            effectivePlayingBytes = min(hardDiskCeiling, req)
+        }
+        let effectivePausedBytes: Int? = {
+            guard !isLiveSession else { return nil }
+            if let pausedReq = requestedPausedForegroundCacheBudgetBytes, pausedReq > 0 {
+                return min(hardDiskCeiling, max(effectivePlayingBytes ?? 0, pausedReq))
+            }
+            return effectivePlayingBytes
+        }()
+        let cacheRetentionRequestBytes: Int? = isLiveSession ? nil : (effectivePausedBytes ?? effectivePlayingBytes)
         let capRelaxed = Self.retentionCapRelaxed(forwardWindowSegments: forwardWindowSegments)
         // Size the custom byte ceiling against capacity left by other running sessions.
         var resolvedBudget: SessionCacheBudgetResolution?
         let claim = RetentionClaims.shared.claim(volumeAvailableBytes: availableBytes) { remaining in
             let budget = Self.resolveSessionCacheBudget(
-                requestedBytes: isLiveSession ? nil : requestedSessionCacheBudgetBytes,
+                requestedBytes: cacheRetentionRequestBytes,
                 volumeAvailableBytes: remaining,
                 capRelaxed: capRelaxed)
             resolvedBudget = budget
@@ -2028,6 +2108,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let budget = resolvedBudget ?? Self.resolveSessionCacheBudget(
             requestedBytes: nil, volumeAvailableBytes: availableBytes, capRelaxed: capRelaxed)
         let retentionBudget = claim.bytes
+        let enforcedHardCeiling = min(hardDiskCeiling, retentionBudget)
+        let enforcedPlayingBudget = min(enforcedHardCeiling, effectivePlayingBytes ?? retentionBudget)
+        let enforcedPausedBudget = min(enforcedHardCeiling, effectivePausedBytes ?? enforcedPlayingBudget)
         let segmentCache = SegmentCache(
             forwardWindow: forwardWindowSegments,
             retentionBudgetBytes: retentionBudget,
@@ -2036,9 +2119,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
             nativeLiveDVRPolicy: isLiveSession ? nativeLiveDVRPolicy : nil,
             onResidentSetChanged: { [weak self] in self?.noteResidentSetChanged() }
         )
+        if !isLiveSession, !plan.isEmpty {
+            segmentCache.setSegmentTimeline(
+                starts: plan.map(\.startSeconds),
+                ends: plan.map { $0.startSeconds + $0.durationSeconds }
+            )
+        }
         claim.track { [weak segmentCache] in segmentCache?.totalBytes ?? 0 }
         restartLock.lock()
         self.retentionBudgetBytes = retentionBudget
+        self.resolvedPlayingPrefetchBudgetBytes = enforcedPlayingBudget
+        self.resolvedPausedPrefetchBudgetBytes = enforcedPausedBudget
+        self.resolvedHardDiskCeilingBytes = enforcedHardCeiling
         self.sessionCacheVolumeSafetyLimitBytes = budget.volumeSafetyLimitBytes
         self.sessionCacheBaseEffectiveBytes = min(retentionBudget, budget.baseEffectiveBytes)
         self.retentionClaim = claim
@@ -4226,6 +4318,31 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // consumer issues no forward fetch; its frozen fetch target is not a wedge). Threaded onto every
         // producer (initial + restart) so the guard survives scrub/audio-switch rebuilds.
         prod.wantsToPlayProvider = playIntentProvider
+        // SVPlayer modification (2026-11-24): Provide seconds-based adaptive prefetch policy + 70%
+        // hysteresis + foreground-paused expansion up to the platform disk ceiling for VOD sessions.
+        if !isLiveSession,
+           requestedTargetForwardBufferSeconds != nil
+           || requestedMinAheadBufferSeconds != nil
+           || requestedPausedForegroundCacheBudgetBytes != nil {
+            let playingBudget = resolvedPlayingPrefetchBudgetBytes
+            let pausedBudget = resolvedPausedPrefetchBudgetBytes
+            let hardCeiling = resolvedHardDiskCeilingBytes
+            let targetSec = requestedTargetForwardBufferSeconds ?? 0
+            let minAheadSec = requestedMinAheadBufferSeconds ?? PrefetchDiskBudget.defaultMinAheadSeconds
+            let expandedFlag = foregroundPausedPrefetchExpandedFlag
+            let hasPausedExpansion = requestedPausedForegroundCacheBudgetBytes != nil
+            prod.prefetchPolicyProvider = {
+                let pausedExpanded = hasPausedExpansion && expandedFlag.withLock { $0 }
+                return HLSSegmentProducer.PrefetchRuntimePolicy(
+                    budgetBytes: pausedExpanded ? pausedBudget : playingBudget,
+                    hardCeilingBytes: hardCeiling,
+                    targetForwardSeconds: targetSec,
+                    minAheadSeconds: pausedExpanded ? PrefetchDiskBudget.safetyFloorSeconds : minAheadSec,
+                    bypassWindowCap: pausedExpanded,
+                    hysteresisResumeRatio: PrefetchDiskBudget.defaultHysteresisResumeRatio
+                )
+            }
+        }
         #if os(tvOS)
         let isTVOS = true
         #else

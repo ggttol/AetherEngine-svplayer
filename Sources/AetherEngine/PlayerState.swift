@@ -1124,6 +1124,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// remote server directly.
     public var forwardBufferSegments: Int?
 
+    // SVPlayer modification (2026-11-24): Seconds-based adaptive prefetch targets, auto bitrate sizing,
+    // and foreground-paused disk fill ceiling (iOS/iPadOS/macOS 2 GB, tvOS 1 GB, <= 1/4 free space).
+    public var targetForwardBufferSeconds: Double? = nil
+    public var minAheadBufferSeconds: Double? = nil
+    public var pausedForegroundCacheByteBudget: Int? = nil
+    public var autoSizeSessionCacheFromBitrate: Bool = false
+
     /// Optional temporary session-cache budget. Nil retains automatic sizing; zero keeps only the working window.
     public var sessionCacheByteBudget: Int? = nil
     /// Opt-in hard total for resident AND in-flight fMP4 bytes. Unlike retention, this is not raised to the old hard window.
@@ -1315,6 +1322,10 @@ public struct LoadOptions: Sendable, Equatable {
         externalSubtitles: [ExternalSubtitleTrack] = [],
         initialSubtitleTrackID: Int? = nil,
         forwardBufferSegments: Int? = nil,
+        targetForwardBufferSeconds: Double? = nil,
+        minAheadBufferSeconds: Double? = nil,
+        pausedForegroundCacheByteBudget: Int? = nil,
+        autoSizeSessionCacheFromBitrate: Bool = false,
         sessionCacheByteBudget: Int? = nil,
         sessionCacheHardLimitBytes: Int? = nil,
         sessionCacheFreeReserveBytes: Int = 0,
@@ -1390,6 +1401,10 @@ public struct LoadOptions: Sendable, Equatable {
         self.externalSubtitles = externalSubtitles
         self.initialSubtitleTrackID = initialSubtitleTrackID
         self.forwardBufferSegments = forwardBufferSegments
+        self.targetForwardBufferSeconds = targetForwardBufferSeconds
+        self.minAheadBufferSeconds = minAheadBufferSeconds
+        self.pausedForegroundCacheByteBudget = pausedForegroundCacheByteBudget
+        self.autoSizeSessionCacheFromBitrate = autoSizeSessionCacheFromBitrate
         self.sessionCacheByteBudget = sessionCacheByteBudget
         self.sessionCacheHardLimitBytes = sessionCacheHardLimitBytes
         self.sessionCacheFreeReserveBytes = max(0, sessionCacheFreeReserveBytes)

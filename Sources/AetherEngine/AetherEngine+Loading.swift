@@ -997,6 +997,11 @@ extension AetherEngine {
             heldSourceConnection: loadedOptions.heldSourceConnection,
             declaredDurationSeconds: loadedOptions.declaredDurationSeconds,
             forwardBufferSegments: forwardBufferSegmentsForSession(loadedOptions.forwardBufferSegments),
+            // SVPlayer modification (2026-11-24): Forward seconds-based adaptive prefetch & paused expansion options.
+            targetForwardBufferSeconds: loadedOptions.targetForwardBufferSeconds,
+            minAheadBufferSeconds: loadedOptions.minAheadBufferSeconds,
+            pausedForegroundCacheByteBudget: loadedOptions.pausedForegroundCacheByteBudget,
+            autoSizeSessionCacheFromBitrate: loadedOptions.autoSizeSessionCacheFromBitrate,
             sessionCacheByteBudget: loadedOptions.sessionCacheByteBudget,
             sessionCacheHardLimitBytes: loadedOptions.sessionCacheHardLimitBytes,
             sessionCacheFreeReserveBytes: loadedOptions.sessionCacheFreeReserveBytes
@@ -1688,8 +1693,11 @@ extension AetherEngine {
                         hasTransportRolled: self.hasTransportRolled,
                         transportIntentIsPlaying: self.nativeHost?.transportIntentIsPlaying ?? true
                     ), self.state != .paused { self.state = .paused }
+                    // SVPlayer modification (2026-11-24): Sync foreground-paused prefetch expansion with transport state.
+                    self.syncForegroundPausedPrefetchExpansion()
                 case .playing, .waitingToPlayAtSpecifiedRate:
                     if self.state != .playing { self.state = .playing }
+                    self.syncForegroundPausedPrefetchExpansion()
                 @unknown default:
                     break
                 }

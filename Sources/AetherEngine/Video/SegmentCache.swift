@@ -99,6 +99,10 @@ final class SegmentCache: @unchecked Sendable {
     /// Set by a backpressure or disk-headroom park, cleared by the next store. Guarded by `condition`.
     private var _parkedSinceStore = false
     private var _producerParked = false
+    // SVPlayer modification (2026-11-24): Window park hysteresis state and segment timeline for seconds-based prefetch math.
+    private var _windowParked = false
+    private var segmentStartSeconds: [Double] = []
+    private var segmentEndSeconds: [Double] = []
     private var _evictionCount = 0
     private var _lastFailure: SessionCacheFailureReason?
     private var _lastCleanupReason: SessionCacheCleanupReason?
@@ -517,6 +521,7 @@ final class SegmentCache: @unchecked Sendable {
         _totalBytes = 0
         _highestStoredIndex = -1
         _producerParked = false
+        _windowParked = false
         _parkedSinceStore = false
         condition.broadcast()
         condition.unlock()
@@ -942,6 +947,85 @@ final class SegmentCache: @unchecked Sendable {
         return currentTargetIndex >= target
     }
 
+    // SVPlayer modification (2026-11-24): Record segment plan timestamps so prefetch parks evaluate real duration in seconds.
+    func setSegmentTimeline(starts: [Double], ends: [Double]) {
+        condition.lock()
+        segmentStartSeconds = starts
+        segmentEndSeconds = ends
+        condition.unlock()
+    }
+
+    /// Must be called with `condition` held. Computes buffered forward duration (seconds) from consumer target to `head`.
+    private func forwardAheadSecondsLocked(head: Int, fallbackStrideSeconds: Double = 4.0) -> Double {
+        let anchor = max(0, currentTargetIndex)
+        let aheadSegs = max(0, head - anchor)
+        guard aheadSegs > 0 else { return 0 }
+        if !segmentStartSeconds.isEmpty, !segmentEndSeconds.isEmpty,
+           anchor < segmentStartSeconds.count {
+            let lastIdx = min(head - 1, segmentEndSeconds.count - 1)
+            if lastIdx >= anchor {
+                return max(0, segmentEndSeconds[lastIdx] - segmentStartSeconds[anchor])
+            }
+        }
+        return Double(aheadSegs) * fallbackStrideSeconds
+    }
+
+    // SVPlayer modification (2026-11-24): Seconds-based forward window park with 70% park/resume hysteresis
+    // and dynamic bypass when foreground pause buffering is filling up to the platform disk ceiling.
+    func awaitForwardWindowHeadroom(
+        head: Int,
+        targetSeconds: Double,
+        windowSegments: Int,
+        bypassWindowCap: Bool,
+        resumeRatio: Double = PrefetchDiskBudget.defaultHysteresisResumeRatio,
+        timeout: TimeInterval = 1.0
+    ) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        if closed {
+            _windowParked = false
+            return false
+        }
+        if bypassWindowCap {
+            _windowParked = false
+            return true
+        }
+        let anchor = max(0, currentTargetIndex)
+        let aheadSegs = max(0, head - anchor)
+        let aheadSec = forwardAheadSecondsLocked(head: head)
+        if !PrefetchDiskBudget.shouldParkWindow(
+            aheadSeconds: aheadSec,
+            targetSeconds: targetSeconds,
+            aheadSegments: aheadSegs,
+            windowSegments: windowSegments,
+            currentlyParked: _windowParked,
+            resumeRatio: resumeRatio
+        ) {
+            _windowParked = false
+            return true
+        }
+        _windowParked = true
+        _parkedSinceStore = true
+        _ = condition.wait(until: Date().addingTimeInterval(timeout))
+        if closed {
+            _windowParked = false
+            return false
+        }
+        let afterAnchor = max(0, currentTargetIndex)
+        let afterSegs = max(0, head - afterAnchor)
+        let afterSec = forwardAheadSecondsLocked(head: head)
+        let stillPark = PrefetchDiskBudget.shouldParkWindow(
+            aheadSeconds: afterSec,
+            targetSeconds: targetSeconds,
+            aheadSegments: afterSegs,
+            windowSegments: windowSegments,
+            currentlyParked: _windowParked,
+            resumeRatio: resumeRatio
+        )
+        _windowParked = stillPark
+        return !stillPark
+    }
+
     /// Evict segments strictly below cutoff, which the live caller bounds at the consumer's own fetch
     /// point (`VideoSegmentProvider.liveEvictionFloor`) so this never unlinks the segment a response is
     /// about to stat; pruneOutsideWindow handles the forward bound.
@@ -1267,27 +1351,65 @@ final class SegmentCache: @unchecked Sendable {
     /// #207 producer park step: true once the producer may write `head`. Withheld while its race-ahead
     /// has reached `budgetBytes` and the consumer still has a safe lead behind it; the extras eviction
     /// that follows the advancing playhead is what frees the room again.
-    func awaitPrefetchDiskHeadroom(head: Int, budgetBytes: Int, timeout: TimeInterval = 1.0) -> Bool {
+    // SVPlayer modification (2026-11-24): Support seconds-based minAhead, 70% park/resume hysteresis,
+    // and hard platform/free-space disk ceiling while retaining backward-compatible default behavior.
+    func awaitPrefetchDiskHeadroom(
+        head: Int,
+        budgetBytes: Int,
+        minAheadSeconds: Double? = nil,
+        hardCeilingBytes: Int? = nil,
+        resumeRatio: Double = PrefetchDiskBudget.defaultHysteresisResumeRatio,
+        timeout: TimeInterval = 1.0
+    ) -> Bool {
         condition.lock()
         defer { condition.unlock() }
-        if !shouldParkLocked(head: head, budgetBytes: budgetBytes) {
+        if !shouldParkLocked(
+            head: head,
+            budgetBytes: budgetBytes,
+            minAheadSeconds: minAheadSeconds,
+            hardCeilingBytes: hardCeilingBytes,
+            resumeRatio: resumeRatio
+        ) {
             _producerParked = false
             return true
         }
         _producerParked = true
         _parkedSinceStore = true
         _ = condition.wait(until: Date().addingTimeInterval(timeout))
-        let released = !shouldParkLocked(head: head, budgetBytes: budgetBytes)
+        let released = !shouldParkLocked(
+            head: head,
+            budgetBytes: budgetBytes,
+            minAheadSeconds: minAheadSeconds,
+            hardCeilingBytes: hardCeilingBytes,
+            resumeRatio: resumeRatio
+        )
         _producerParked = !released
         return released
     }
 
     /// Must be called with condition held.
-    private func shouldParkLocked(head: Int, budgetBytes: Int) -> Bool {
-        PrefetchDiskBudget.shouldPark(forwardBytes: currentForwardBytes(),
-                                      budgetBytes: budgetBytes,
-                                      head: head,
-                                      consumerTarget: currentTargetIndex)
+    private func shouldParkLocked(
+        head: Int,
+        budgetBytes: Int,
+        minAheadSeconds: Double? = nil,
+        hardCeilingBytes: Int? = nil,
+        resumeRatio: Double = PrefetchDiskBudget.defaultHysteresisResumeRatio
+    ) -> Bool {
+        if let minAheadSeconds {
+            return PrefetchDiskBudget.shouldPark(
+                forwardBytes: currentForwardBytes(),
+                budgetBytes: budgetBytes,
+                aheadSeconds: forwardAheadSecondsLocked(head: head),
+                minAheadSeconds: minAheadSeconds,
+                currentlyParked: _producerParked,
+                resumeRatio: resumeRatio,
+                hardCeilingBytes: hardCeilingBytes
+            )
+        }
+        return PrefetchDiskBudget.shouldPark(forwardBytes: currentForwardBytes(),
+                                             budgetBytes: budgetBytes,
+                                             head: head,
+                                             consumerTarget: currentTargetIndex)
     }
 
     /// Must be called with condition held.

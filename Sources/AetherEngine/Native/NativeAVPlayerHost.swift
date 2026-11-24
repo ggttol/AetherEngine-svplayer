@@ -1054,11 +1054,12 @@ final class NativeAVPlayerHost {
                 guard let self, self.sessionID == sid else { return }
                 // Live rate, not the notification's: a play() right after a pause() must not be undone by the older echo.
                 let rate = self.avPlayer.rate
+                let tcs = self.avPlayer.timeControlStatus
                 let ready = self.playerItem?.status == .readyToPlay
                 let old = self.playIntent
                 let intent = (self.prematureEndRecoveryInFlight || !ready)
                     ? old
-                    : Self.playIntentAfterRateChange(reason: reason, rate: rate, current: old)
+                    : Self.playIntentAfterRateChange(reason: reason, rate: rate, current: old, timeControlStatus: tcs)
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(sid) rate change reason=\(reason?.rawValue ?? "nil") "
                     + "rate=\(rate) ready=\(ready) play intent \(old) -> \(intent)",
@@ -1208,10 +1209,19 @@ final class NativeAVPlayerHost {
     /// Pure decision for the rate-change mirror: an explicit rate write (`setRateCalled`, e.g. AVKit's
     /// transport bar) sets the intent to whether the live rate is non-zero; any other or missing reason
     /// (end of item, interruption, background) keeps the current intent.
+    // SVPlayer modification (2026-11-24): While automaticallyWaitsToMinimizeStalling holds AVPlayer in
+    // .waitingToPlayAtSpecifiedRate, avPlayer.rate reads 0.0 even after play() was called. Keep `current`
+    // playIntent during buffering waits so in-flight audio-shaping / session reloads never drop playIntent.
     nonisolated static func playIntentAfterRateChange(
-        reason: AVPlayer.RateDidChangeReason?, rate: Float, current: Bool
+        reason: AVPlayer.RateDidChangeReason?,
+        rate: Float,
+        current: Bool,
+        timeControlStatus: AVPlayer.TimeControlStatus? = nil
     ) -> Bool {
-        reason == .setRateCalled ? rate != 0 : current
+        guard reason == .setRateCalled else { return current }
+        if rate != 0 { return true }
+        if timeControlStatus == .waitingToPlayAtSpecifiedRate { return current }
+        return false
     }
 
     /// #50: AVPlayer fires .failed for self-healing transients (loopback 404, AVIOReader reconnect) while playback advances uninterrupted (rrgomes: tcs=playing at .failed).

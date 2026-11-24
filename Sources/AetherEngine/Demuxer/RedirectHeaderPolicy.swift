@@ -8,6 +8,8 @@ import Foundation
 /// conflicting auth mechanisms with 400. Non-credential headers are replayed
 /// unconditionally so header-dependent proxies keep working (#8).
 enum RedirectHeaderPolicy {
+    // SVPlayer modification (2026-11-24): Include X-Plex-Token so direct Plex streams strip server
+    // credentials if redirected to an external/presigned CDN host.
     private static let credentialHeaders: Set<String> = [
         "authorization",
         "proxy-authorization",
@@ -15,6 +17,7 @@ enum RedirectHeaderPolicy {
         "x-emby-token",
         "x-emby-authorization",
         "x-mediabrowser-token",
+        "x-plex-token",
     ]
 
     static func headersToReplay(

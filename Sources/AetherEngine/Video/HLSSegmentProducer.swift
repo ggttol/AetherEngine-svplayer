@@ -1477,6 +1477,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// false instead of misreading the frozen fetch target as a wedge (issue #65 pause false-positive).
     var wantsToPlayProvider: (@Sendable () -> Bool)?
 
+    // SVPlayer modification (2026-11-24): Runtime prefetch policy closure supporting seconds-based minAhead,
+    // 70% park/resume hysteresis, and foreground-paused expansion up to the platform disk ceiling.
+    struct PrefetchRuntimePolicy: Sendable, Equatable {
+        var budgetBytes: Int
+        var hardCeilingBytes: Int
+        var targetForwardSeconds: Double
+        var minAheadSeconds: Double
+        var bypassWindowCap: Bool
+        var hysteresisResumeRatio: Double
+    }
+    var prefetchPolicyProvider: (@Sendable () -> PrefetchRuntimePolicy)?
+
     /// AE#1018: true while a folded RPU cannot reach the picture; `FelCurveLookahead` reads it per GOP.
     var felFoldUnseenProvider: (@Sendable () -> Bool)?
 
@@ -2189,7 +2201,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
             initialRenderedPosition: playbackPositionProvider?()
         )
         while !checkShouldStop() {
-            if cache.awaitFetchHighWater(reaching: target, timeout: 1.0) {
+            // SVPlayer modification (2026-11-24): Use seconds-based forward window hysteresis and allow
+            // foreground-paused buffering to bypass the active playing window cap up to the disk ceiling.
+            let released: Bool
+            if let policy = prefetchPolicyProvider?() {
+                released = cache.awaitForwardWindowHeadroom(
+                    head: head,
+                    targetSeconds: policy.targetForwardSeconds,
+                    windowSegments: bufferAheadSegments,
+                    bypassWindowCap: policy.bypassWindowCap,
+                    resumeRatio: policy.hysteresisResumeRatio,
+                    timeout: 1.0
+                )
+            } else {
+                released = cache.awaitFetchHighWater(reaching: target, timeout: 1.0)
+            }
+            if released {
                 retunePumpQoS()
                 if parked >= Self.backpressureWedgeLogThresholdSeconds {
                     EngineLog.emit(
@@ -2355,7 +2382,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Returns true on release, false when stop was requested.
     private func awaitPrefetchDiskBudgetRelease(head: Int, context: String,
                                                 detectWedge: Bool = false) -> Bool {
-        guard prefetchDiskBudgetBytes > 0 else { return true }
+        guard prefetchDiskBudgetBytes > 0 || prefetchPolicyProvider != nil else { return true }
         if pumpQoSCurrent == QOS_CLASS_UTILITY { pumpRelaxationRate.reset() }
         // #240: same release as the backpressure park; a parked pump is not using the link.
         sideReaderLinkGate?.videoFetchEnded()
@@ -2373,9 +2400,30 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 initialRenderedPosition: playbackPositionProvider?())
             : nil
         while !checkShouldStop() {
-            if cache.awaitPrefetchDiskHeadroom(head: head,
-                                               budgetBytes: prefetchDiskBudgetBytes,
-                                               timeout: 1.0) {
+            // SVPlayer modification (2026-11-24): Re-read runtime prefetch policy each iteration so
+            // foreground pause expansion (2 GB / 1 GB / 1/4 free) and 70% hysteresis take effect live.
+            let activeBudget: Int
+            let released: Bool
+            if let policy = prefetchPolicyProvider?() {
+                activeBudget = policy.budgetBytes
+                if activeBudget <= 0 { return true }
+                released = cache.awaitPrefetchDiskHeadroom(
+                    head: head,
+                    budgetBytes: policy.budgetBytes,
+                    minAheadSeconds: policy.minAheadSeconds,
+                    hardCeilingBytes: policy.hardCeilingBytes,
+                    resumeRatio: policy.hysteresisResumeRatio,
+                    timeout: 1.0
+                )
+            } else {
+                activeBudget = prefetchDiskBudgetBytes
+                released = cache.awaitPrefetchDiskHeadroom(
+                    head: head,
+                    budgetBytes: prefetchDiskBudgetBytes,
+                    timeout: 1.0
+                )
+            }
+            if released {
                 if parked >= Self.prefetchDiskParkLogThresholdSeconds {
                     EngineLog.emit(
                         "[HLSSegmentProducer] #207 prefetch disk park released (\(context)) head=\(head) "
@@ -2394,7 +2442,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 EngineLog.emit(
                     "[HLSSegmentProducer] #207 prefetch disk PARK (\(context)) head=\(head) "
                     + "cacheTarget=\(cache.targetIndex) forward=\(cache.forwardBytes / (1 << 20)) MiB "
-                    + "budget=\(prefetchDiskBudgetBytes / (1 << 20)) MiB parked=\(parked)s "
+                    + "budget=\(activeBudget / (1 << 20)) MiB parked=\(parked)s "
                     + "(opt-in prefetch full; resumes as playback advances)",
                     category: .session
                 )
