@@ -137,6 +137,15 @@ extension AVIOReader {
                 // Advisory length for the EOF/EIO distinction; -1 (chunked / unknown) leaves the
                 // clean-end path as the only EOF source.
                 guard let self else { return }
+                // SVPlayer modification (2026-11-25): Capture response Content-Type, HTTP status,
+                // and explicit 0-byte bodies on the forward-only streaming path for invalid-data diagnosis.
+                if let http = response as? HTTPURLResponse {
+                    self.recordOpenHTTPMetadata(
+                        status: http.statusCode,
+                        contentType: http.value(forHTTPHeaderField: "Content-Type"),
+                        expectedContentLength: http.expectedContentLength
+                    )
+                }
                 let expected = response.expectedContentLength
                 guard expected > 0 else { return }
                 self.streamLock.lock()
@@ -145,6 +154,7 @@ extension AVIOReader {
             },
             onRefused: { [weak self] status, respondedBy in
                 guard let self else { return }
+                self.recordOpenHTTPMetadata(status: status, contentType: nil, expectedContentLength: nil)
                 self.streamLock.lock()
                 self.streamRefusedStatus = status
                 self.streamLock.unlock()
@@ -170,7 +180,12 @@ extension AVIOReader {
             // Owned bytes: the chunk is retained until it is consumed, and a delivery that still
             // references the transport's dispatch_data would pin its buffer for that long.
             let firstDelivery = self.streamBuffer.isEmpty && self.streamBytesRead == 0
-            self.streamBuffer.append(data.withUnsafeBytes { Data($0) })
+            let ownedChunk = data.withUnsafeBytes { Data($0) }
+            // SVPlayer modification (2026-11-25): Retain the leading head prefix of the forward-only
+            // stream for post-open HLS / non-media / MPEG-TS resync diagnostics.
+            let headWriteOffset = self.streamBytesRead + Int64(self.streamBuffer.count)
+            self.recordSniffedHeadBytes(ownedChunk, atOffset: headWriteOffset)
+            self.streamBuffer.append(ownedChunk)
             if firstDelivery { self.clearRecordedTransportFailure() }
             self.streamPeakBytes = max(self.streamPeakBytes, self.streamBuffer.count)
             var toCancel: URLSessionDataTask?

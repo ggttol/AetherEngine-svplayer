@@ -44,6 +44,12 @@ public struct PlaybackErrorKind: RawRepresentable, Sendable, Equatable, Hashable
     /// time (AE#958). Before this kind the same session played repeated or shifted audio and video,
     /// or failed as `vodSourceFailed` / `softwarePipelineFailed`.
     public static let sourceFabricatesRanges = PlaybackErrorKind(rawValue: "sourceFabricatesRanges")
+    // SVPlayer modification (2026-11-25): Distinct classifications for non-media 2xx payloads
+    // (HTML/JSON/XML/text error pages, empty 0-byte streams) and corrupt/encrypted/unsupported
+    // container inputs so hosts can surface actionable localized diagnostics instead of bare
+    // FFmpeg AVERROR_INVALIDDATA text.
+    public static let sourceNonMediaPayload = PlaybackErrorKind(rawValue: "sourceNonMediaPayload")
+    public static let sourceCorruptOrUnsupported = PlaybackErrorKind(rawValue: "sourceCorruptOrUnsupported")
     /// A custom `IOReader`'s initial probe failed. The host built that reader, so only the host can
     /// re-point it.
     public static let customSourceProbeFailed = PlaybackErrorKind(rawValue: "customSourceProbeFailed")
@@ -107,6 +113,35 @@ public struct PlaybackErrorKind: RawRepresentable, Sendable, Equatable, Hashable
     public static let storageExhausted = PlaybackErrorKind(rawValue: "storageExhausted")
 }
 
+// SVPlayer modification (2026-11-25): Structured diagnostic reason for AVERROR_INVALIDDATA
+// and non-media response bodies detected at the byte-reader or demuxer open boundary.
+public enum InvalidMediaInputReason: String, Sendable, Equatable, Hashable, Codable, CaseIterable {
+    case htmlErrorPage = "html_error_page"
+    case jsonErrorResponse = "json_error_response"
+    case xmlErrorResponse = "xml_error_response"
+    case textErrorResponse = "text_error_response"
+    case emptyStream = "empty_stream"
+    case hlsPlaylist = "hls_playlist"
+    case encryptedOrDRM = "encrypted_or_drm"
+    case corruptOrUnsupported = "corrupt_or_unsupported"
+
+    static let userInfoKey = "AetherInvalidMediaInputReason"
+
+    static func preserved(in error: Error?) -> Self? {
+        var next = error as NSError?
+        for _ in 0..<6 {
+            guard let current = next else { break }
+            if current.domain == DemuxerError.errorDomain,
+               let raw = current.userInfo[userInfoKey] as? String,
+               let reason = Self(rawValue: raw) {
+                return reason
+            }
+            next = current.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return nil
+    }
+}
+
 /// Machine-readable companion to the text inside `PlaybackState.error` (#376).
 ///
 /// The message alone cannot classify a failure: roughly half of them are the engine's own sentence,
@@ -129,6 +164,9 @@ public struct PlaybackErrorInfo: Sendable, Equatable {
     public let hlsDiagnosticReason: HLSIngestDiagnosticReason?
     /// Original negative FFmpeg error, separate from the stable NSError case code.
     public let ffmpegErrorCode: Int?
+    // SVPlayer modification (2026-11-25): Structured subreason when AVERROR_INVALIDDATA or
+    // non-media payload sniffing diagnosed why the source could not be demuxed.
+    public let invalidMediaReason: InvalidMediaInputReason?
     /// The same text `state` carries.
     public let message: String
 
@@ -137,13 +175,15 @@ public struct PlaybackErrorInfo: Sendable, Equatable {
                 underlyingDomain: String? = nil,
                 underlyingCode: Int? = nil,
                 hlsDiagnosticReason: HLSIngestDiagnosticReason? = nil,
-                ffmpegErrorCode: Int? = nil) {
+                ffmpegErrorCode: Int? = nil,
+                invalidMediaReason: InvalidMediaInputReason? = nil) {
         self.kind = kind
         self.message = message
         self.underlyingDomain = underlyingDomain
         self.underlyingCode = underlyingCode
         self.hlsDiagnosticReason = hlsDiagnosticReason
         self.ffmpegErrorCode = ffmpegErrorCode
+        self.invalidMediaReason = invalidMediaReason
     }
 
     /// Captures domain and code off a Foundation / AVFoundation error, which is the half of the
@@ -155,7 +195,8 @@ public struct PlaybackErrorInfo: Sendable, Equatable {
                   underlyingDomain: nsError?.domain,
                   underlyingCode: nsError?.code,
                   hlsDiagnosticReason: .preserved(in: underlying),
-                  ffmpegErrorCode: DemuxerError.preservedFFmpegCode(in: underlying))
+                  ffmpegErrorCode: DemuxerError.preservedFFmpegCode(in: underlying),
+                  invalidMediaReason: InvalidMediaInputReason.preserved(in: underlying))
     }
 }
 
@@ -247,6 +288,25 @@ extension AetherEngine {
             publishError(PlaybackErrorInfo(kind: kind,
                                            message: "Failed to load: \(error.localizedDescription)",
                                            underlyingCode: status))
+            return
+        }
+        // SVPlayer modification (2026-11-25): Preserve structured invalid-media / non-media
+        // payload diagnostics on PlaybackErrorInfo so upper layers can present clear localized causes.
+        if let demuxError = error as? DemuxerError,
+           case .invalidMediaInput(let code, let reason, _, let httpStatus) = demuxError {
+            let kind: PlaybackErrorKind
+            switch reason {
+            case .htmlErrorPage, .jsonErrorResponse, .xmlErrorResponse, .textErrorResponse, .emptyStream:
+                kind = .sourceNonMediaPayload
+            case .encryptedOrDRM, .corruptOrUnsupported, .hlsPlaylist:
+                kind = .sourceCorruptOrUnsupported
+            }
+            publishError(PlaybackErrorInfo(kind: kind,
+                                           message: "Failed to load: \(demuxError.description)",
+                                           underlyingDomain: DemuxerError.errorDomain,
+                                           underlyingCode: httpStatus ?? Int(code),
+                                           ffmpegErrorCode: Int(code),
+                                           invalidMediaReason: reason))
             return
         }
         if isLiveStart {

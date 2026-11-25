@@ -1263,6 +1263,122 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var openSuggestsDisc = false
     private var headSpanServeLogged = false
 
+    // SVPlayer modification (2026-11-25): Leaf-locked capture of leading offset-0 bytes,
+    // HTTP status, Content-Type, and 0-byte response markers across persistent, streaming,
+    // and chunked paths so Demuxer can diagnose AVERROR_INVALIDDATA and catch late #EXTM3U.
+    static let sniffedHeadCapacity = 16 * 1024
+    private let sniffLock = NSLock()
+    private var sniffedHeadBytes: [UInt8] = []
+    private var sniffContentType: String?
+    private var sniffLastHTTPStatus: Int = 0
+    private var sniffInitialRefusalStatus: Int = 0
+    private var sniffSawZeroLength: Bool = false
+
+    struct OpenSniffSnapshot {
+        let prefix: [UInt8]
+        let contentType: String?
+        let httpStatus: Int
+        let totalBytesFetched: Int64
+        let endedEmpty: Bool
+    }
+
+    func recordSniffedHeadBytes(_ data: Data, atOffset offset: Int64) {
+        guard !data.isEmpty, offset >= 0 else { return }
+        sniffLock.lock()
+        sniffInitialRefusalStatus = 0
+        if offset == Int64(sniffedHeadBytes.count), sniffedHeadBytes.count < Self.sniffedHeadCapacity {
+            let take = min(data.count, Self.sniffedHeadCapacity - sniffedHeadBytes.count)
+            sniffedHeadBytes.append(contentsOf: data.prefix(take))
+        }
+        sniffLock.unlock()
+    }
+
+    func recordOpenHTTPMetadata(
+        status: Int,
+        contentType: String?,
+        expectedContentLength: Int64?,
+        contentRange: String? = nil
+    ) {
+        sniffLock.lock()
+        sniffLastHTTPStatus = status
+        if status >= 400 {
+            let isZeroLengthRange = status == 416
+                && (contentRange?.replacingOccurrences(of: " ", with: "").hasSuffix("*/0") == true)
+            if isZeroLengthRange {
+                sniffSawZeroLength = true
+            } else if sniffedHeadBytes.isEmpty {
+                sniffInitialRefusalStatus = status
+            }
+        } else if (200...299).contains(status) {
+            if let contentType, !contentType.isEmpty, sniffContentType == nil {
+                sniffContentType = contentType
+            }
+            if expectedContentLength == 0 {
+                sniffSawZeroLength = true
+            }
+        }
+        sniffLock.unlock()
+    }
+
+    var openTransportSecurityCode: Int? {
+        streamLock.lock()
+        let code = transportSecurityCode
+        streamLock.unlock()
+        return code != 0 ? code : nil
+    }
+
+    var openRefusalHTTPStatus: Int? {
+        guard cumulativeBytesFetched == 0 else { return nil }
+        streamLock.lock()
+        let sRefused = streamRefusedStatus
+        streamLock.unlock()
+        if sRefused >= 400 { return sRefused }
+        sniffLock.lock()
+        let initRefusal = sniffInitialRefusalStatus
+        let zeroLen = sniffSawZeroLength
+        sniffLock.unlock()
+        if initRefusal >= 400, !zeroLen { return initRefusal }
+        winCond.lock()
+        let pRefusal = (connEnded && window.isEmpty && connStatus >= 400) ? connStatus : 0
+        winCond.unlock()
+        if pRefusal >= 400, !(pRefusal == 416 && zeroLen) { return pRefusal }
+        return nil
+    }
+
+    var openSniffSnapshot: OpenSniffSnapshot {
+        let fetched = cumulativeBytesFetched
+        sniffLock.lock()
+        let prefix = sniffedHeadBytes
+        let capturedCT = sniffContentType
+        let status = sniffLastHTTPStatus
+        let zeroLen = sniffSawZeroLength
+        sniffLock.unlock()
+        let ct = capturedCT ?? openResponseContentType
+        let endedWithoutData: Bool
+        if zeroLen {
+            endedWithoutData = true
+        } else if fetched == 0 {
+            if isStreaming {
+                streamLock.lock()
+                endedWithoutData = streamEnded && streamBuffer.isEmpty
+                streamLock.unlock()
+            } else {
+                winCond.lock()
+                endedWithoutData = connEnded && window.isEmpty
+                winCond.unlock()
+            }
+        } else {
+            endedWithoutData = false
+        }
+        return OpenSniffSnapshot(
+            prefix: prefix,
+            contentType: ct,
+            httpStatus: status,
+            totalBytesFetched: fetched,
+            endedEmpty: endedWithoutData
+        )
+    }
+
     // MARK: Fragment headers of a fragmented MP4
     //
     // libavformat indexes a fragmented MP4 by reading every top-level `moof` before the header
@@ -1674,6 +1790,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // The open has its first bytes in hand, so there is nothing to wait for. Waiting
                 // anyway would spend the round trip this whole feature exists to remove.
                 gotData = true
+                recordSniffedHeadBytes(warm.head.data, atOffset: 0)
                 openPrefix = Array(warm.head.data.prefix(Self.openSniffBytes))
             } else {
                 winCond.lock()
@@ -1735,7 +1852,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // terminal state. Fail closed here, before the reconnect loop is ever entered: a raw media
             // container never begins with '#' (TS syncs on 0x47; MP4/MKV open with binary box/EBML markers),
             // so an #EXTM3U prefix is an unambiguous misroute. The host is pointed at the HLS entry points.
-            if isLive, gotData, Self.bodyBeginsWithHLSPlaylistTag(openPrefix) {
+            if isLive, gotData, Self.looksLikeHLSPlaylist(prefix: openPrefix, contentType: openResponseContentType) {
                 EngineLog.emit("[AVIOReader] HLS playlist body on the raw live path (AE#140); stopping here. A URL source is routed onto the live ingest by load() (AE#363); a custom reader keeps the typed rejection.", category: .demux)
                 markClosed()
                 close()
@@ -1745,7 +1862,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // neither probe an m3u8 behind a custom pb (no extension / MIME hint reaches the hls
             // probe) nor fetch a variant, so avformat_open_input dies with AVERROR_INVALIDDATA.
             // Fail typed instead; load() reroutes the URL onto the native remote-HLS bypass.
-            if !isLive, gotData, Self.bodyBeginsWithHLSPlaylistTag(openPrefix) {
+            if !isLive, gotData, Self.looksLikeHLSPlaylist(prefix: openPrefix, contentType: openResponseContentType) {
                 EngineLog.emit("[AVIOReader] HLS playlist body on the VOD loopback path (AE#154); rerouting to the native remote-HLS bypass.", category: .demux)
                 markClosed()
                 close()
@@ -1810,6 +1927,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     // forward-only (which is what the ladder's streaming fallback did for it
                     // anyway), and one that refuses both fails typed with its status.
                     let pumpRefusal = (!gotData && Self.isResolvedExpiryStatus(pumpStatus)) ? pumpStatus : 0
+                    // SVPlayer modification (2026-11-25): Preserve non-expiry 4xx/5xx refusals
+                    // (e.g. 500/502/503/429) as the streaming fallback status when zero bytes arrive.
+                    let streamingFallbackRefusal = (!gotData && pumpStatus >= 400 && pumpStatus != 416) ? pumpStatus : 0
                     if pumpRefusal != 0 {
                         EngineLog.emit(
                             "[AVIOReader] \(label) data connection refused status=\(pumpRefusal) at offset 0; "
@@ -1831,7 +1951,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     if isStreaming {
                         startStreamingDownload()
                         _ = streamDataReady.wait(timeout: .now() + .seconds(15))
-                        try failIfStreamingRefused(fallbackStatus: pumpRefusal)
+                        try failIfStreamingRefused(fallbackStatus: streamingFallbackRefusal)
                     } else {
                         // Audit DMX-101: a cold open that was refused or slow never judged the
                         // origin's range support, and the probe above takes a 200's Content-Length
@@ -1850,14 +1970,47 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                             try probeControl?.check()
                             if confirmation == .ignored {
                                 openForwardOnlyBecauseRangeIsIgnored(contentLength: caught.contentLength)
-                                try failIfStreamingRefused(fallbackStatus: 0)
+                                try failIfStreamingRefused(fallbackStatus: streamingFallbackRefusal)
                             } else {
                                 startPersistentConnection(at: 0)
-                                if !awaitFirstPersistentData() {
+                                let postConfirmData = awaitFirstPersistentData()
+                                if postConfirmData {
+                                    // SVPlayer modification (2026-11-25): Sniff post-confirm persistent head for HLS/DASH.
+                                    let postPrefix = firstWindowPrefix(max: Self.openSniffBytes)
+                                    if Self.looksLikeHLSPlaylist(prefix: postPrefix, contentType: openResponseContentType) {
+                                        markClosed()
+                                        close()
+                                        throw AVIOReaderError.hlsPlaylistOnVODPath
+                                    }
+                                    if DASHManifest.bodyBeginsWithManifest(postPrefix) {
+                                        markClosed()
+                                        close()
+                                        throw AVIOReaderError.dashManifest
+                                    }
+                                } else {
+                                    try failIfPostProbePersistentRefused()
                                     EngineLog.emit("[AVIOReader] Persistent open (post-probe): no data within the open budget, proceeding to read-loop reconnect", category: .demux)
                                 }
                             }
-                        } else if !gotData {
+                        } else if gotData {
+                            // SVPlayer modification (2026-11-25): Sniff post-probe persistent head for HLS/DASH
+                            // when cold open resolved no data and HEAD/range-probe discovered a size.
+                            let postPrefix = firstWindowPrefix(max: Self.openSniffBytes)
+                            if Self.looksLikeHLSPlaylist(prefix: postPrefix, contentType: openResponseContentType) {
+                                EngineLog.emit("[AVIOReader] \(label) HLS playlist body on post-probe persistent open; rerouting onto remote HLS.", category: .demux)
+                                markClosed()
+                                close()
+                                throw AVIOReaderError.hlsPlaylistOnVODPath
+                            }
+                            if DASHManifest.bodyBeginsWithManifest(postPrefix) {
+                                markClosed()
+                                close()
+                                throw AVIOReaderError.dashManifest
+                            }
+                        } else {
+                            // SVPlayer modification (2026-11-25): Surface HTTP 4xx/5xx refusal (e.g. proxy 502
+                            // after HEAD 200) instead of letting avformat_open_input fail with bare INVALIDDATA.
+                            try failIfPostProbePersistentRefused()
                             EngineLog.emit("[AVIOReader] Persistent open (post-probe): no data within the open budget, proceeding to read-loop reconnect", category: .demux)
                         }
                     }
@@ -1906,8 +2059,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 if let data = fetchChunk(from: 0, size: chunkSize) {
                     currentBuffer = data
                     currentOffset = 0
+                    recordSniffedHeadBytes(data, atOffset: 0)
+                    let chunkPrefix = [UInt8](data.prefix(Self.openSniffBytes))
+                    // SVPlayer modification (2026-11-25): Classify #EXTM3U playlists on non-prefetch opens too.
+                    if Self.looksLikeHLSPlaylist(prefix: chunkPrefix, contentType: openResponseContentType) {
+                        EngineLog.emit("[AVIOReader] \(label) HLS playlist body on non-prefetch open; failing typed.", category: .demux)
+                        markClosed()
+                        close()
+                        throw isLive ? AVIOReaderError.hlsPlaylistOnRawLivePath : AVIOReaderError.hlsPlaylistOnVODPath
+                    }
                     // AE#859: the bounded probe reader opens here, past the persistent-window check.
-                    if DASHManifest.bodyBeginsWithManifest([UInt8](data.prefix(Self.openSniffBytes))) {
+                    if DASHManifest.bodyBeginsWithManifest(chunkPrefix) {
                         EngineLog.emit("[AVIOReader] \(label) MPEG-DASH manifest body (AE#859); handing it to the DASH opener.", category: .demux)
                         markClosed()
                         close()
@@ -1923,6 +2085,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         close()
                         throw AVIOReaderError.discImageMediaType
                     }
+                } else {
+                    // SVPlayer modification (2026-11-25): Propagate TLS or HTTP refusal from failed initial chunk fetch.
+                    if let tlsCode = openTransportSecurityCode {
+                        markClosed()
+                        close()
+                        throw AVIOReaderError.transportSecurityFailed(code: tlsCode)
+                    }
+                    if let refusal = openRefusalHTTPStatus {
+                        markClosed()
+                        close()
+                        throw AVIOReaderError.httpStatus(refusal)
+                    }
                 }
             }
         }
@@ -1932,7 +2106,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // playlist endpoint answering 200 without a length lands exactly there, so the same check
         // runs on the stream's first bytes before FFmpeg is handed the m3u8 as container bytes.
         let streamPrefix = isStreaming ? firstStreamPrefix(max: Self.openSniffBytes) : []
-        if isStreaming, Self.bodyBeginsWithHLSPlaylistTag(streamPrefix) {
+        if isStreaming, Self.looksLikeHLSPlaylist(prefix: streamPrefix, contentType: openSniffSnapshot.contentType) {
             EngineLog.emit("[AVIOReader] \(label) HLS playlist body on the forward-only open (AE#733); rerouting like AE#140/#154.", category: .demux)
             markClosed()
             close()
@@ -2054,6 +2228,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             category: .demux)
     }
 
+    // SVPlayer modification (2026-11-25): Fail typed if the post-probe persistent open
+    // ended with a TLS error or HTTP 4xx/5xx status (for example, HEAD 200 followed by GET 502).
+    private func failIfPostProbePersistentRefused() throws {
+        try failIfStreamingRefused(fallbackStatus: 0)
+        winCond.lock()
+        let refusedStatus = (connEnded && window.isEmpty && connStatus >= 400) ? connStatus : 0
+        winCond.unlock()
+        guard refusedStatus >= 400 else { return }
+        if refusedStatus == 416, openSniffSnapshot.endedEmpty { return }
+        EngineLog.emit(
+            "[AVIOReader] \(label) post-probe persistent open refused HTTP \(refusedStatus); failing the open typed",
+            category: .demux)
+        markClosed()
+        close()
+        throw AVIOReaderError.httpStatus(refusedStatus)
+    }
+
     private func failIfStreamingRefused(fallbackStatus: Int) throws {
         streamLock.lock()
         let refused = streamRefusedStatus
@@ -2164,15 +2355,211 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// leading ASCII whitespace. A raw media container never opens with '#', so this is an unambiguous
     /// signal that an m3u8 playlist was handed to the raw-byte reader (AE#140). Static + internal so the
     /// classifier is unit-tested without a live origin.
+    // SVPlayer modification (2026-11-25): Match `#EXTM3U` case-insensitively and pair with
+    // Content-Type / payload classifiers + MPEG-TS leading-garbage resync scanner.
     static func bodyBeginsWithHLSPlaylistTag(_ bytes: [UInt8]) -> Bool {
         var i = 0
         if bytes.count >= 3, bytes[0] == 0xEF, bytes[1] == 0xBB, bytes[2] == 0xBF { i = 3 }
         while i < bytes.count, bytes[i] == 0x20 || bytes[i] == 0x09 || bytes[i] == 0x0A || bytes[i] == 0x0D {
             i += 1
         }
-        let tag = Array("#EXTM3U".utf8)
+        let tag = Array("#extm3u".utf8)
         guard bytes.count - i >= tag.count else { return false }
-        return Array(bytes[i..<(i + tag.count)]) == tag
+        for offset in 0..<tag.count {
+            var b = bytes[i + offset]
+            if b >= 0x41 && b <= 0x5A { b += 32 } // ASCII uppercase -> lowercase
+            if b != tag[offset] { return false }
+        }
+        let nextIdx = i + tag.count
+        if nextIdx < bytes.count {
+            let next = bytes[nextIdx]
+            guard next == 0x0A || next == 0x0D || next == 0x20 || next == 0x09 else { return false }
+        }
+        return true
+    }
+
+    static func looksLikeHLSPlaylist(prefix: [UInt8], contentType: String?) -> Bool {
+        if bodyBeginsWithHLSPlaylistTag(prefix) { return true }
+        guard let ct = contentType?.lowercased(),
+              ct.contains("mpegurl") || ct.contains("vnd.apple.mpegurl") else {
+            return false
+        }
+        guard !prefix.isEmpty, !prefix.prefix(1024).contains(0) else { return false }
+        guard let text = String(bytes: prefix.prefix(1024), encoding: .utf8)?.lowercased() else {
+            return false
+        }
+        return text.contains("#extm3u") || text.contains("#ext-x-") || text.contains("#extinf:")
+    }
+
+    /// Classifies non-media or encrypted/unparseable payloads when opening fails with AVERROR_INVALIDDATA.
+    static func classifyNonMediaPayload(
+        prefix: [UInt8],
+        contentType: String?,
+        isCompleteEmptyBody: Bool = false
+    ) -> InvalidMediaInputReason? {
+        if prefix.isEmpty {
+            return isCompleteEmptyBody ? .emptyStream : nil
+        }
+        if looksLikeHLSPlaylist(prefix: prefix, contentType: contentType) {
+            return .hlsPlaylist
+        }
+        if DASHManifest.bodyBeginsWithManifest(prefix) {
+            return nil
+        }
+
+        var start = 0
+        if prefix.count >= 3, prefix[0] == 0xEF, prefix[1] == 0xBB, prefix[2] == 0xBF { start = 3 }
+        while start < prefix.count,
+              prefix[start] == 0x20 || prefix[start] == 0x09 || prefix[start] == 0x0A || prefix[start] == 0x0D {
+            start += 1
+        }
+        if start >= prefix.count {
+            return isCompleteEmptyBody ? .emptyStream : nil
+        }
+
+        let ctLower = (contentType ?? "").lowercased()
+        let sample = Array(prefix[start..<min(prefix.count, start + 1024)])
+        if !sample.contains(0), let text = String(bytes: sample, encoding: .utf8) {
+            let lower = text.lowercased()
+            // 1. HTML error / login / WAF challenge page
+            let htmlPrefixes = [
+                "<!doctype html", "<html", "<head", "<body", "<title",
+                "<script", "<meta", "<h1", "<div", "<center", "<p>"
+            ]
+            if htmlPrefixes.contains(where: { lower.hasPrefix($0) }) {
+                return .htmlErrorPage
+            }
+            if lower.hasPrefix("<!--"),
+               (lower.contains("<html") || lower.contains("<!doctype") || lower.contains("<body")
+                || lower.contains("<head") || lower.contains("<title")) {
+                return .htmlErrorPage
+            }
+            if (ctLower.contains("text/html") || ctLower.contains("xhtml")),
+               lower.contains("<"), lower.contains(">") {
+                return .htmlErrorPage
+            }
+
+            // 2. JSON API error payload
+            if lower.hasPrefix("{") || lower.hasPrefix("[") {
+                let isJSONArrayObjectOrString: Bool = {
+                    guard lower.hasPrefix("[") else { return true }
+                    let rest = lower.dropFirst().drop(while: { $0 == " " || $0 == "\t" || $0 == "\r" || $0 == "\n" })
+                    return rest.first == "{" || rest.first == "\""
+                }()
+                let hasJSONStructure = isJSONArrayObjectOrString && (
+                    ctLower.contains("json")
+                        || (lower.contains("\"") && lower.contains(":"))
+                        || lower == "{}" || lower == "[]"
+                )
+                if hasJSONStructure {
+                    return .jsonErrorResponse
+                }
+            }
+
+            // 3. XML error response (non-DASH, e.g. S3/OSS <Error><Code>AccessDenied</Code></Error>)
+            let xmlPrefixes = ["<?xml", "<error", "<response", "<result", "<accessdenied"]
+            if (xmlPrefixes.contains(where: { lower.hasPrefix($0) }) || (ctLower.contains("xml") && lower.hasPrefix("<"))),
+               lower.contains(">") {
+                return .xmlErrorResponse
+            }
+
+            // 4. Plain-text error / notice response (only reached after FFmpeg rejected input)
+            let printableScalars = text.unicodeScalars.reduce(0) { count, scalar in
+                let v = scalar.value
+                let isPrintable = v >= 0x20 || v == 0x09 || v == 0x0A || v == 0x0D
+                return count + (isPrintable ? 1 : 0)
+            }
+            let totalScalars = max(1, text.unicodeScalars.count)
+            let printableRatio = Double(printableScalars) / Double(totalScalars)
+            if ctLower.hasPrefix("text/") || ctLower.contains("javascript") {
+                if printableRatio >= 0.85 { return .textErrorResponse }
+            } else if printableRatio >= 0.95 && totalScalars >= 4 {
+                return .textErrorResponse
+            }
+        }
+
+        // 5. Encrypted / DRM binary signatures (CENC ISO-BMFF boxes or scrambled MPEG-TS)
+        if looksLikeEncryptedISOBMFF(prefix) || looksLikeScrambledMPEGTS(prefix) {
+            return .encryptedOrDRM
+        }
+        return nil
+    }
+
+    private static func containsASCII(_ hay: [UInt8], _ needle: String) -> Bool {
+        let target = Array(needle.utf8)
+        guard !target.isEmpty, hay.count >= target.count else { return false }
+        let limit = hay.count - target.count
+        for i in 0...limit {
+            var matched = true
+            for j in 0..<target.count where hay[i + j] != target[j] {
+                matched = false
+                break
+            }
+            if matched { return true }
+        }
+        return false
+    }
+
+    private static func looksLikeEncryptedISOBMFF(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count >= 16 else { return false }
+        let head = Array(bytes.prefix(32))
+        guard containsASCII(head, "ftyp") else { return false }
+        let hasProtection = containsASCII(bytes, "pssh")
+            || containsASCII(bytes, "encv")
+            || containsASCII(bytes, "enca")
+            || (containsASCII(bytes, "sinf") && containsASCII(bytes, "schm"))
+        return hasProtection
+    }
+
+    private static func looksLikeScrambledMPEGTS(_ bytes: [UInt8]) -> Bool {
+        let packetSize = 188
+        let neededPackets = 4
+        guard bytes.count >= packetSize * neededPackets else { return false }
+        let baseOffset: Int
+        if bytes[0] == 0x47,
+           (0..<neededPackets).allSatisfy({ bytes[$0 * packetSize] == 0x47 }) {
+            baseOffset = 0
+        } else if let synced = findMPEGTSResyncOffset(in: bytes) {
+            baseOffset = synced
+        } else {
+            return false
+        }
+        var scrambled = 0
+        for k in 0..<neededPackets {
+            let p = baseOffset + k * packetSize
+            guard p + 4 <= bytes.count else { break }
+            if (bytes[p + 3] & 0xC0) != 0 {
+                scrambled += 1
+            }
+        }
+        return scrambled >= 3
+    }
+
+    /// Scans up to 8 KiB past byte 0 for 5 consecutive 188-byte MPEG-TS packets (0x47 sync +
+    /// valid header bits, excluding constant 0x47 fills). Used strictly as a fallback after normal
+    /// `avformat_open_input` failed with AVERROR_INVALIDDATA (e.g. fake PNG/GIF/padding prefix).
+    static func findMPEGTSResyncOffset(in bytes: [UInt8]) -> Int? {
+        let packetSize = 188
+        let requiredPackets = 5
+        guard bytes.count >= packetSize * requiredPackets + 1 else { return nil }
+        let maxOffset = min(8192, bytes.count - packetSize * requiredPackets)
+        guard maxOffset >= 1 else { return nil }
+        for offset in 1...maxOffset {
+            guard bytes[offset] == 0x47 else { continue }
+            if bytes[offset + 1] == 0x47, bytes[offset + 2] == 0x47, bytes[offset + 3] == 0x47 {
+                continue
+            }
+            var valid = true
+            for k in 0..<requiredPackets {
+                let p = offset + k * packetSize
+                if bytes[p] != 0x47 || (bytes[p + 1] & 0x80) != 0 || (bytes[p + 3] & 0x30) == 0 {
+                    valid = false
+                    break
+                }
+            }
+            if valid { return offset }
+        }
+        return nil
     }
 
     /// Under a single winCond critical section: snapshot whether the optimistic open-time
@@ -4761,6 +5148,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         let base = window.count
         window.append(data)
+        // SVPlayer modification (2026-11-25): Record offset-0 head bytes for post-open
+        // AVERROR_INVALIDDATA classification, late #EXTM3U detection, and MPEG-TS resync.
+        if winStart == 0 {
+            recordSniffedHeadBytes(data, atOffset: Int64(base))
+        }
         // #281 retest: retain the head of the file for the open phase, as it arrives. It cannot be
         // copied later out of the window, because `trimWindowLocked` drops it as the parse reads
         // forward, which is why the seek-time park misses on every layout whose parse reads more
@@ -4859,6 +5251,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         generation: Int
     ) -> Bool {
         let status = http.statusCode
+        // SVPlayer modification (2026-11-25): Capture HTTP status, Content-Type, and 0-byte markers
+        // for structured invalid-data diagnostics if avformat_open_input subsequently fails.
+        recordOpenHTTPMetadata(
+            status: status,
+            contentType: http.value(forHTTPHeaderField: "Content-Type"),
+            expectedContentLength: http.expectedContentLength,
+            contentRange: http.value(forHTTPHeaderField: "Content-Range")
+        )
         var isOK = status == 200 || status == 206
         var retryAfter: TimeInterval = 0
         if Self.isRateLimitStatus(status) {
@@ -5557,6 +5957,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 let (data, response) = try syncRequest(request, budget: budget)
                 if let http = response as? HTTPURLResponse {
                     let status = http.statusCode
+                    // SVPlayer modification (2026-11-25): Capture HTTP status/Content-Type on chunk fetches.
+                    recordOpenHTTPMetadata(
+                        status: status,
+                        contentType: http.value(forHTTPHeaderField: "Content-Type"),
+                        expectedContentLength: http.expectedContentLength,
+                        contentRange: http.value(forHTTPHeaderField: "Content-Range")
+                    )
                     if status != 200 && status != 206 {
                         if usingCachedURL && Self.isResolvedExpiryStatus(status) {
                             invalidateResolvedURL()

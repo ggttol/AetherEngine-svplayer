@@ -5173,7 +5173,8 @@ public final class AetherEngine: ObservableObject {
                 // A failure that lands after a successor took over is not this session's to publish.
                 if loadGeneration != gen { throw CancellationError() }
                 // Without this catch, a throwing loadRemoteHLS would strand state at .loading forever.
-                publishError(.sourceOpenFailed, "Failed to load: \(error.localizedDescription)", underlying: error)
+                // SVPlayer modification (2026-11-25): Preserve structured HTTP/TLS/HLS diagnostics on remote-HLS failure.
+                publishLoadFailure(error)
                 throw error
             }
             // No probe ran on this bypass; there is nothing to report.
@@ -5435,6 +5436,25 @@ public final class AetherEngine: ObservableObject {
             throw failure
         }
 
+        // SVPlayer modification (2026-11-25): Fail fast on deterministic open-time refusals,
+        // TLS trust rejections, and diagnosed non-media / corrupt-input probe failures instead
+        // of silently swallowing them and re-opening the same URL a second time in HLSVideoEngine.
+        if !options.isLive, !probeOpened, let failure = probeFailure {
+            if let readerError = failure as? AVIOReaderError {
+                switch readerError {
+                case .httpStatus, .transportSecurityFailed:
+                    publishLoadFailure(readerError)
+                    throw readerError
+                default:
+                    break
+                }
+            } else if let demuxError = failure as? DemuxerError,
+                      case .invalidMediaInput = demuxError {
+                publishLoadFailure(demuxError)
+                throw demuxError
+            }
+        }
+
         // AE#363: an HLS playlist URL on the raw-byte live path, which AE#140 detects at the byte source
         // (#EXTM3U where a container's first byte belongs) instead of looping its endless-feed reconnect.
         // That detection stays; its destination changes. AE#140 handed the host a typed rejection naming
@@ -5509,7 +5529,8 @@ public final class AetherEngine: ObservableObject {
                 throw CancellationError()
             } catch {
                 if loadGeneration != gen { throw CancellationError() }
-                publishError(.sourceOpenFailed, "Failed to load: \(error.localizedDescription)", underlying: error)
+                // SVPlayer modification (2026-11-25): Preserve structured diagnostics on rerouted remote-HLS failure.
+                publishLoadFailure(error)
                 throw error
             }
             return nil
@@ -6722,6 +6743,32 @@ public final class AetherEngine: ObservableObject {
             // rather than surfacing a terminal failure for a source AVPlayer can play. A full load()
             // restart (the #168 reroute's shape) is what clears the half-built loopback session; the
             // bypass runs no probe, so this cannot bounce back here a second time.
+            if RemoteHLSMediaSelection.shouldRouteLiveOntoIngest(
+                failure: error, isCustomSource: isCustomSource),
+               case .url(let livePlaylistURL) = source,
+               loadGeneration == gen {
+                // SVPlayer modification (2026-11-25): Mirror AE#363 if the session's own open was
+                // the first to read an extensionless live #EXTM3U playlist body.
+                EngineLog.emit(
+                    "[AetherEngine] SVPlayer: the loopback session's own open classified the live "
+                    + "source as HLS; routing through the live-ingest reader",
+                    category: .engine
+                )
+                RemoteHLSMediaSelection.noteLivePlaylist(livePlaylistURL)
+                continueStartupAcrossReroute()
+                return try await load(
+                    source: .custom(
+                        HLSLiveIngestReader.engineIngest(playlistURL: livePlaylistURL,
+                                                         httpHeaders: loadedOptions.httpHeaders,
+                                                         diagnosticContext: loadedOptions.sourceDiagnosticsContext),
+                        formatHint: "mpegts"
+                    ),
+                    startPosition: startPosition,
+                    options: loadedOptions,
+                    audioSourceStreamIndex: audioSourceStreamIndex,
+                    discTitleID: discTitleID
+                )
+            }
             if RemoteHLSMediaSelection.shouldReroute(failure: error, isCustomSource: isCustomSource),
                case .url(let hlsURL) = source,
                loadGeneration == gen {

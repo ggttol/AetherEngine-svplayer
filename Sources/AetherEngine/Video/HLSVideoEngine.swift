@@ -1595,6 +1595,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 break
             }
         }
+        // SVPlayer modification (2026-11-25): Preserve structured Demuxer invalid-media diagnostics
+        // verbatim instead of flattening them into an opaque English openFailed(reason:) string.
+        if let demuxError = error as? DemuxerError, case .invalidMediaInput = demuxError {
+            return demuxError
+        }
         return HLSVideoEngineError.openFailed(reason: "\(error)")
     }
 

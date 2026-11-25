@@ -819,6 +819,32 @@ public final class Demuxer: @unchecked Sendable {
         let ret = avformat_open_input(&ctx, urlString, nil, &opts)
         av_dict_free(&opts)
         guard ret == 0, let openedCtx = ctx else {
+            // SVPlayer modification (2026-11-25): On local AVERROR_INVALIDDATA, attempt safe
+            // MPEG-TS leading-garbage resync and otherwise throw structured payload diagnostics.
+            if !isCloseRequested, ret == FFmpegErr.invalidData, url.isFileURL {
+                let headBytes = Self.readLocalHeadBytes(url: url, limit: AVIOReader.sniffedHeadCapacity)
+                if let syncOffset = AVIOReader.findMPEGTSResyncOffset(in: headBytes), syncOffset > 0,
+                   let fileReader = FileIOReader(url: url) {
+                    adoptOwnedSourceReader(fileReader)
+                    let bridge = CustomIOReaderBridge(reader: fileReader)
+                    if (try? bridge.open()) != nil {
+                        avioProvider = bridge
+                        if tryRecoverInvalidDataOpen(provider: bridge, offset: Int64(syncOffset), formatName: "mpegts", isLive: false) {
+                            return
+                        }
+                        bridge.close()
+                        avioProvider = nil
+                    }
+                    releaseOwnedSourceReader()
+                }
+                let reason = AVIOReader.classifyNonMediaPayload(
+                    prefix: headBytes,
+                    contentType: nil,
+                    isCompleteEmptyBody: headBytes.isEmpty
+                ) ?? .corruptOrUnsupported
+                Self.logInvalidMediaInput(reason: reason, code: ret, httpStatus: nil, contentType: nil, prefix: headBytes)
+                throw DemuxerError.invalidMediaInput(code: ret, reason: reason, contentType: nil, httpStatus: nil)
+            }
             throw DemuxerError.openFailed(code: ret)
         }
         formatContext = openedCtx
@@ -826,7 +852,61 @@ public final class Demuxer: @unchecked Sendable {
         // one rather than reported separately.
         reportOpenStage(.containerOpened)
 
-        try probeStreams(openedCtx)
+        // SVPlayer modification (2026-11-25): Reclassify stream-info failures on encrypted/scrambled
+        // inputs and zero-stream DRM/non-media opens into structured invalidMediaInput diagnostics.
+        do {
+            try probeStreams(openedCtx)
+        } catch let error as DemuxerError {
+            if !isCloseRequested,
+               case .streamInfoFailed(let code) = error,
+               let classified = Self.classifyPostOpenFailure(
+                   provider: nil,
+                   customReader: nil,
+                   localURL: url.isFileURL ? url : nil,
+                   code: code,
+                   allowOnlyEncryptedUnlessInvalidData: true
+               ) {
+                Self.logInvalidMediaInput(
+                    reason: classified.reason,
+                    code: code,
+                    httpStatus: classified.httpStatus,
+                    contentType: classified.contentType,
+                    prefix: classified.prefix
+                )
+                releaseOpenedContextAfterFailure()
+                throw DemuxerError.invalidMediaInput(
+                    code: code,
+                    reason: classified.reason,
+                    contentType: classified.contentType,
+                    httpStatus: classified.httpStatus
+                )
+            }
+            throw error
+        }
+        if !isCloseRequested,
+           openedCtx.pointee.nb_streams == 0,
+           let classified = Self.classifyPostOpenFailure(
+               provider: nil,
+               customReader: nil,
+               localURL: url.isFileURL ? url : nil,
+               code: FFmpegErr.invalidData,
+               allowOnlyEncryptedUnlessInvalidData: false
+           ) {
+            Self.logInvalidMediaInput(
+                reason: classified.reason,
+                code: FFmpegErr.invalidData,
+                httpStatus: classified.httpStatus,
+                contentType: classified.contentType,
+                prefix: classified.prefix
+            )
+            releaseOpenedContextAfterFailure()
+            throw DemuxerError.invalidMediaInput(
+                code: FFmpegErr.invalidData,
+                reason: classified.reason,
+                contentType: classified.contentType,
+                httpStatus: classified.httpStatus
+            )
+        }
         accessLock.lock()
         refreshStreamTableLocked()
         accessLock.unlock()
@@ -879,7 +959,7 @@ public final class Demuxer: @unchecked Sendable {
         }
         let bridge = CustomIOReaderBridge(reader: reader, preservesSourcePosition: isLive)
         let inputFormat: UnsafePointer<AVInputFormat>? = formatHint.flatMap { av_find_input_format($0) }
-        try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
+        try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive, customReader: reader)
     }
 
     /// A remote disc image (ISO 9660 / UDF / BDMV) by URL extension, or an extensionless URL this
@@ -1072,7 +1152,8 @@ public final class Demuxer: @unchecked Sendable {
     private func openWithProvider(
         _ provider: AVIOProvider,
         inputFormat: UnsafePointer<AVInputFormat>? = nil,
-        isLive: Bool = false
+        isLive: Bool = false,
+        customReader: IOReader? = nil
     ) throws {
         // Audit DMX-102: the provider is published BEFORE it connects, under the same lock that
         // decides "already closed", so a `markClosed()` that lands during the connect (up to 15 s on
@@ -1198,7 +1279,114 @@ public final class Demuxer: @unchecked Sendable {
         av_dict_free(&opts)
         guard ret == 0 else {
             formatContext = nil
-            openTransportFailureCode = (avioProvider as? AVIOReader)?.lastTransportFailureCode
+            let httpReader = avioProvider as? AVIOReader
+            openTransportFailureCode = httpReader?.lastTransportFailureCode
+
+            // SVPlayer modification (2026-11-25): Before discarding the provider on open failure,
+            // inspect TLS/HTTP refusals, late-arriving #EXTM3U playlists, safe MPEG-TS resync /
+            // container-hint recovery, and structured non-media payload diagnostics.
+            if !isCloseRequested {
+                if let reader = httpReader {
+                    if let tlsCode = reader.openTransportSecurityCode {
+                        avioProvider?.close()
+                        avioProvider = nil
+                        throw AVIOReaderError.transportSecurityFailed(code: tlsCode)
+                    }
+                    if let status = reader.openRefusalHTTPStatus {
+                        avioProvider?.close()
+                        avioProvider = nil
+                        throw AVIOReaderError.httpStatus(status)
+                    }
+                    let sniff = reader.openSniffSnapshot
+                    if AVIOReader.looksLikeHLSPlaylist(prefix: sniff.prefix, contentType: sniff.contentType) {
+                        EngineLog.emit(
+                            "[Demuxer] post-open sniff detected HLS playlist body (isLive=\(isLive)); routing typed",
+                            category: .demux
+                        )
+                        avioProvider?.close()
+                        avioProvider = nil
+                        throw isLive ? AVIOReaderError.hlsPlaylistOnRawLivePath : AVIOReaderError.hlsPlaylistOnVODPath
+                    }
+                    if ret == FFmpegErr.invalidData {
+                        if inputFormat == nil,
+                           let syncOffset = AVIOReader.findMPEGTSResyncOffset(in: sniff.prefix),
+                           syncOffset > 0,
+                           tryRecoverInvalidDataOpen(provider: provider, offset: Int64(syncOffset), formatName: "mpegts", isLive: isLive) {
+                            return
+                        }
+                        let classified = AVIOReader.classifyNonMediaPayload(
+                            prefix: sniff.prefix,
+                            contentType: sniff.contentType,
+                            isCompleteEmptyBody: sniff.endedEmpty
+                        )
+                        if inputFormat == nil,
+                           classified == nil,
+                           let hintedFormat = Self.mappedInputFormatName(forContainerHint: activeStreamHints?.container),
+                           tryRecoverInvalidDataOpen(provider: provider, offset: 0, formatName: hintedFormat, isLive: isLive) {
+                            return
+                        }
+                        let reason = classified ?? .corruptOrUnsupported
+                        let httpStatus = sniff.httpStatus > 0 ? sniff.httpStatus : nil
+                        Self.logInvalidMediaInput(
+                            reason: reason,
+                            code: ret,
+                            httpStatus: httpStatus,
+                            contentType: sniff.contentType,
+                            prefix: sniff.prefix
+                        )
+                        avioProvider?.close()
+                        avioProvider = nil
+                        throw DemuxerError.invalidMediaInput(
+                            code: ret,
+                            reason: reason,
+                            contentType: sniff.contentType,
+                            httpStatus: httpStatus
+                        )
+                    } else if sniff.endedEmpty && sniff.totalBytesFetched == 0 {
+                        let httpStatus = sniff.httpStatus > 0 ? sniff.httpStatus : nil
+                        Self.logInvalidMediaInput(
+                            reason: .emptyStream,
+                            code: ret,
+                            httpStatus: httpStatus,
+                            contentType: sniff.contentType,
+                            prefix: sniff.prefix
+                        )
+                        avioProvider?.close()
+                        avioProvider = nil
+                        throw DemuxerError.invalidMediaInput(
+                            code: ret,
+                            reason: .emptyStream,
+                            contentType: sniff.contentType,
+                            httpStatus: httpStatus
+                        )
+                    }
+                } else if ret == FFmpegErr.invalidData {
+                    let headBytes = Self.readCustomHeadBytes(reader: customReader, isSeekable: provider.isSeekable, limit: AVIOReader.sniffedHeadCapacity)
+                    if inputFormat == nil,
+                       provider.isSeekable,
+                       let syncOffset = AVIOReader.findMPEGTSResyncOffset(in: headBytes),
+                       syncOffset > 0,
+                       tryRecoverInvalidDataOpen(provider: provider, offset: Int64(syncOffset), formatName: "mpegts", isLive: isLive) {
+                        return
+                    }
+                    let reason = AVIOReader.classifyNonMediaPayload(
+                        prefix: headBytes,
+                        contentType: nil,
+                        isCompleteEmptyBody: headBytes.isEmpty && provider.isSeekable
+                    ) ?? .corruptOrUnsupported
+                    Self.logInvalidMediaInput(
+                        reason: reason,
+                        code: ret,
+                        httpStatus: nil,
+                        contentType: nil,
+                        prefix: headBytes
+                    )
+                    avioProvider?.close()
+                    avioProvider = nil
+                    throw DemuxerError.invalidMediaInput(code: ret, reason: reason, contentType: nil, httpStatus: nil)
+                }
+            }
+
             avioProvider?.close()
             avioProvider = nil
             throw DemuxerError.openFailed(code: ret)
@@ -1207,7 +1395,62 @@ public final class Demuxer: @unchecked Sendable {
         reportOpenStage(.containerOpened)   // #361
         declareDiscSubpictureStreams(ctxPtr!)
 
-        try probeStreams(ctxPtr!)
+        // SVPlayer modification (2026-11-25): Reclassify stream-info failures (e.g. scrambled
+        // MPEG-TS hitting EOF) and zero-stream encrypted/non-media opens (e.g. CENC DRM MP4)
+        // as structured invalidMediaInput instead of opaque streamInfoFailed/noVideoStream.
+        do {
+            try probeStreams(ctxPtr!)
+        } catch let error as DemuxerError {
+            if !isCloseRequested,
+               case .streamInfoFailed(let code) = error,
+               let classified = Self.classifyPostOpenFailure(
+                   provider: provider,
+                   customReader: customReader,
+                   localURL: nil,
+                   code: code,
+                   allowOnlyEncryptedUnlessInvalidData: true
+               ) {
+                Self.logInvalidMediaInput(
+                    reason: classified.reason,
+                    code: code,
+                    httpStatus: classified.httpStatus,
+                    contentType: classified.contentType,
+                    prefix: classified.prefix
+                )
+                releaseOpenedContextAfterFailure()
+                throw DemuxerError.invalidMediaInput(
+                    code: code,
+                    reason: classified.reason,
+                    contentType: classified.contentType,
+                    httpStatus: classified.httpStatus
+                )
+            }
+            throw error
+        }
+        if !isCloseRequested,
+           ctxPtr!.pointee.nb_streams == 0,
+           let classified = Self.classifyPostOpenFailure(
+               provider: provider,
+               customReader: customReader,
+               localURL: nil,
+               code: FFmpegErr.invalidData,
+               allowOnlyEncryptedUnlessInvalidData: false
+           ) {
+            Self.logInvalidMediaInput(
+                reason: classified.reason,
+                code: FFmpegErr.invalidData,
+                httpStatus: classified.httpStatus,
+                contentType: classified.contentType,
+                prefix: classified.prefix
+            )
+            releaseOpenedContextAfterFailure()
+            throw DemuxerError.invalidMediaInput(
+                code: FFmpegErr.invalidData,
+                reason: classified.reason,
+                contentType: classified.contentType,
+                httpStatus: classified.httpStatus
+            )
+        }
         accessLock.lock()
         refreshStreamTableLocked()
         accessLock.unlock()
@@ -1217,6 +1460,202 @@ public final class Demuxer: @unchecked Sendable {
         // find_stream_info is where the trailing-index ping-pong lives, not avformat_open_input.
         avioProvider?.markOpenPhaseFinished()
         promoteAlternativeTransferHLG()
+    }
+
+    // SVPlayer modification (2026-11-25): Tear down formatContext + avioProvider safely when
+    // post-open validation rejects an encrypted/non-media zero-stream or failed-probe input.
+    private func releaseOpenedContextAfterFailure() {
+        accessLock.lock()
+        var closeCtx = formatContext
+        formatContext = nil
+        accessLock.unlock()
+        if closeCtx != nil {
+            avformat_close_input(&closeCtx)
+        }
+        avioProvider?.close()
+        avioProvider = nil
+    }
+
+    // SVPlayer modification (2026-11-25): Inspect sniffed head bytes after avformat_open_input
+    // succeeded to distinguish scrambled TS / CENC DRM MP4 / non-media wrappers from plain EOF.
+    private static func classifyPostOpenFailure(
+        provider: AVIOProvider?,
+        customReader: IOReader?,
+        localURL: URL?,
+        code: Int32,
+        allowOnlyEncryptedUnlessInvalidData: Bool
+    ) -> (reason: InvalidMediaInputReason, contentType: String?, httpStatus: Int?, prefix: [UInt8])? {
+        let prefix: [UInt8]
+        let contentType: String?
+        let httpStatus: Int?
+        let isCompleteEmptyBody: Bool
+
+        if let httpReader = provider as? AVIOReader {
+            let sniff = httpReader.openSniffSnapshot
+            prefix = sniff.prefix
+            contentType = sniff.contentType
+            httpStatus = sniff.httpStatus > 0 ? sniff.httpStatus : nil
+            isCompleteEmptyBody = sniff.endedEmpty
+        } else if let customReader {
+            prefix = Self.readCustomHeadBytes(
+                reader: customReader,
+                isSeekable: provider?.isSeekable ?? false,
+                limit: AVIOReader.sniffedHeadCapacity
+            )
+            contentType = nil
+            httpStatus = nil
+            isCompleteEmptyBody = prefix.isEmpty && (provider?.isSeekable ?? false)
+        } else if let localURL {
+            prefix = Self.readLocalHeadBytes(url: localURL, limit: AVIOReader.sniffedHeadCapacity)
+            contentType = nil
+            httpStatus = nil
+            isCompleteEmptyBody = prefix.isEmpty
+        } else {
+            return nil
+        }
+
+        guard let reason = AVIOReader.classifyNonMediaPayload(
+            prefix: prefix,
+            contentType: contentType,
+            isCompleteEmptyBody: isCompleteEmptyBody
+        ) else {
+            return nil
+        }
+        if allowOnlyEncryptedUnlessInvalidData && code != FFmpegErr.invalidData && reason != .encryptedOrDRM {
+            return nil
+        }
+        return (reason, contentType, httpStatus, prefix)
+    }
+
+    // SVPlayer modification (2026-11-25): Safe fallback recovery & structured payload diagnostics
+    // for AVERROR_INVALIDDATA open failures (leading MPEG-TS garbage resync + server container hint).
+    private func tryRecoverInvalidDataOpen(
+        provider: AVIOProvider,
+        offset: Int64,
+        formatName: String,
+        isLive: Bool
+    ) -> Bool {
+        guard !isCloseRequested,
+              let pb = provider.context,
+              let fmt = av_find_input_format(formatName) else { return false }
+        pb.pointee.eof_reached = 0
+        pb.pointee.error = 0
+        let landed = avio_seek(pb, offset, SEEK_SET)
+        guard landed == offset else { return false }
+        pb.pointee.eof_reached = 0
+        pb.pointee.error = 0
+
+        guard let retryCtx = avformat_alloc_context() else { return false }
+        retryCtx.pointee.pb = pb
+        if restrictToProvidedIO {
+            retryCtx.pointee.io_open = { _, _, _, _, _ in -EPERM }
+        }
+        applyProbeBudget(retryCtx)
+
+        var ctxPtr: UnsafeMutablePointer<AVFormatContext>? = retryCtx
+        var opts: OpaquePointer? = nil
+        Self.applyDemuxerOptions(
+            &opts,
+            isLive: isLive,
+            skipDurationEstimate: openProfile.avioSequentialOnly,
+            skipAttachments: openProfile.skipsAttachments
+        )
+        let ret = avformat_open_input(&ctxPtr, nil, fmt, &opts)
+        av_dict_free(&opts)
+        guard ret == 0, let openedCtx = ctxPtr else {
+            formatContext = nil
+            return false
+        }
+        formatContext = openedCtx
+        do {
+            try probeStreams(openedCtx)
+            let readiness = StreamInfoTolerance.evaluateReadiness(openedCtx)
+            guard readiness.hasKnownCodecMediaStream else {
+                var closing: UnsafeMutablePointer<AVFormatContext>? = openedCtx
+                formatContext = nil
+                avformat_close_input(&closing)
+                return false
+            }
+        } catch {
+            var closing: UnsafeMutablePointer<AVFormatContext>? = openedCtx
+            formatContext = nil
+            avformat_close_input(&closing)
+            return false
+        }
+        reportOpenStage(.containerOpened)
+        accessLock.lock()
+        refreshStreamTableLocked()
+        accessLock.unlock()
+        reportOpenStage(.streamsProbed)
+        avioProvider?.markOpenPhaseFinished()
+        promoteAlternativeTransferHLG()
+        EngineLog.emit(
+            "[Demuxer] recovered invalid-data open via format=\(formatName) resync at byte offset \(offset)",
+            category: .demux
+        )
+        return true
+    }
+
+    private static func mappedInputFormatName(forContainerHint container: String?) -> String? {
+        guard let raw = container?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !raw.isEmpty else { return nil }
+        switch raw {
+        case "ts", "m2ts", "mts", "mpegts": return "mpegts"
+        case "mkv", "webm", "matroska": return "matroska"
+        case "mp4", "m4v", "mov", "3gp": return "mov"
+        case "flv": return "flv"
+        case "avi": return "avi"
+        case "asf", "wmv": return "asf"
+        default: return nil
+        }
+    }
+
+    private static func readLocalHeadBytes(url: URL, limit: Int) -> [UInt8] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: limit), !data.isEmpty else { return [] }
+        return [UInt8](data)
+    }
+
+    private static func readCustomHeadBytes(reader: IOReader?, isSeekable: Bool, limit: Int) -> [UInt8] {
+        guard let reader, isSeekable, limit > 0 else { return [] }
+        guard reader.seek(offset: 0, whence: SEEK_SET) == 0 else { return [] }
+        var bytes = [UInt8](repeating: 0, count: limit)
+        var total = 0
+        while total < limit {
+            let chunkSize = Int32(min(4096, limit - total))
+            let n = bytes.withUnsafeMutableBufferPointer { buf -> Int32 in
+                guard let base = buf.baseAddress else { return -1 }
+                return reader.read(base.advanced(by: total), size: chunkSize)
+            }
+            if n <= 0 { break }
+            total += Int(n)
+        }
+        _ = reader.seek(offset: 0, whence: SEEK_SET)
+        return total > 0 ? Array(bytes.prefix(total)) : []
+    }
+
+    private static func logInvalidMediaInput(
+        reason: InvalidMediaInputReason,
+        code: Int32,
+        httpStatus: Int?,
+        contentType: String?,
+        prefix: [UInt8]
+    ) {
+        let excerpt: String
+        switch reason {
+        case .htmlErrorPage, .jsonErrorResponse, .xmlErrorResponse, .textErrorResponse, .hlsPlaylist:
+            excerpt = AVIOReader.noticeExcerpt(Array(prefix.prefix(256)), limit: 120)
+        default:
+            excerpt = prefix.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " ")
+        }
+        EngineLog.emit(
+            "[Demuxer] invalid media input classified as \(reason.rawValue) "
+            + "(code=\(code) status=\(httpStatus.map(String.init) ?? "-") "
+            + "contentType=\(contentType ?? "-") headBytes=\(prefix.count)"
+            + (excerpt.isEmpty ? "" : " sample=\"\(excerpt)\"") + ")",
+            category: .demux
+        )
     }
 
     /// AE#585: bracket the host's bounded index pass (the cue prewarm and the cursor reset that
@@ -4153,15 +4592,28 @@ enum DemuxerError: Error, CustomNSError, CustomStringConvertible, LocalizedError
     case openFailed(code: Int32)
     case streamInfoFailed(code: Int32)
     case readFailed(code: Int32)
+    // SVPlayer modification (2026-11-25): Structured invalid-media diagnostic error carrying
+    // the sniffed payload classification, HTTP status, Content-Type, and FFmpeg error code.
+    case invalidMediaInput(
+        code: Int32,
+        reason: InvalidMediaInputReason,
+        contentType: String?,
+        httpStatus: Int?
+    )
 
     static var errorDomain: String { "AetherEngine.DemuxerError" }
     static let ffmpegErrorCodeKey = "AetherFFmpegErrorCode"
     var errorUserInfo: [String: Any] {
-        let code: Int32
         switch self {
-        case .openFailed(let value), .streamInfoFailed(let value), .readFailed(let value): code = value
+        case .openFailed(let value), .streamInfoFailed(let value), .readFailed(let value):
+            return [NSLocalizedDescriptionKey: description, Self.ffmpegErrorCodeKey: Int(value)]
+        case .invalidMediaInput(let value, let reason, _, _):
+            return [
+                NSLocalizedDescriptionKey: description,
+                Self.ffmpegErrorCodeKey: Int(value),
+                InvalidMediaInputReason.userInfoKey: reason.rawValue,
+            ]
         }
-        return [NSLocalizedDescriptionKey: description, Self.ffmpegErrorCodeKey: Int(code)]
     }
     // Preserve Swift's implicit NSError codes from before CustomNSError conformance.
     var errorCode: Int {
@@ -4169,6 +4621,7 @@ enum DemuxerError: Error, CustomNSError, CustomStringConvertible, LocalizedError
         case .openFailed: 0
         case .streamInfoFailed: 1
         case .readFailed: 2
+        case .invalidMediaInput: 3
         }
     }
 
@@ -4189,9 +4642,22 @@ enum DemuxerError: Error, CustomNSError, CustomStringConvertible, LocalizedError
     /// distinguishable from a corrupt file.
     var description: String {
         switch self {
-        case .openFailed(let code): "Demuxer: open failed (\(FFmpegErr.text(for: code)))"
-        case .streamInfoFailed(let code): "Demuxer: stream info failed (\(FFmpegErr.text(for: code)))"
-        case .readFailed(let code): "Demuxer: read failed (\(FFmpegErr.text(for: code)))"
+        case .openFailed(let code):
+            return "Demuxer: open failed (\(FFmpegErr.text(for: code)))"
+        case .streamInfoFailed(let code):
+            return "Demuxer: stream info failed (\(FFmpegErr.text(for: code)))"
+        case .readFailed(let code):
+            return "Demuxer: read failed (\(FFmpegErr.text(for: code)))"
+        case .invalidMediaInput(let code, let reason, let contentType, let httpStatus):
+            var parts: [String] = []
+            if let httpStatus, httpStatus > 0 {
+                parts.append("HTTP \(httpStatus)")
+            }
+            if let contentType, !contentType.isEmpty {
+                parts.append("content-type: \(contentType)")
+            }
+            parts.append(FFmpegErr.text(for: code))
+            return "Demuxer: invalid media input [\(reason.rawValue)] (\(parts.joined(separator: ", ")))"
         }
     }
 
