@@ -25,3 +25,4 @@ Modified source files carry a `SVPlayer modification` comment at each change.
 - 2026-11-25: directory thumbnail extraction for large LAN/cloud sources (bounded probe windows, keyframe offset strategy, HDR10/HLG tone mapping, MPEG-TS start-time handling, structured diagnostics); Dolby Vision profile 5 thumbnails are not decoded (placeholder fallback, patent traits stay off).
 - 2026-11-25 (b): tolerant open/probe for sources with incomplete stream information (shorter analysis budget, start from known tracks, host-supplied stream metadata), and seek reconnection keeping the play intent.
 - 2026-11-25 (c): surface structured localized error info when HLSVideoEngine / demuxer hits invalid stream data, and harden stream probing tolerance for malformed segments and forward-only/range AVIOReader paths.
+- 2026-11-26: optimize 10-second seek buffer reuse and startup reload behavior, and auto-attach embedded subtitle tracks on load.

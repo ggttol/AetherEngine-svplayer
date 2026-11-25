@@ -1984,6 +1984,14 @@ extension AetherEngine {
         // behind one it must precede. The generation guard is what keeps a superseded loader from
         // writing into its successor's sequence.
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }
+        // SVPlayer modification (2026-11-26): Scale AVPlayerItem.preferredForwardBufferDuration for VOD
+        // loopback sessions proportionally within the SegmentCache forward window (up to 24 s on Wi-Fi Auto,
+        // 4 s floor on tight windows and unchanged 4 s on live) so ±10 s skips hit AVPlayer's in-memory buffer.
+        let loopbackForwardBufferDuration = Self.resolvedLoopbackForwardBufferDuration(
+            isLive: isLive,
+            targetForwardBufferSeconds: loadedOptions.targetForwardBufferSeconds,
+            forwardBufferSegments: forwardBufferSegmentsForSession(loadedOptions.forwardBufferSegments)
+        )
         host.load(url: playbackURL,
                   startPosition: startPosition,
                   perFrameHDR: true,
@@ -1995,6 +2003,7 @@ extension AetherEngine {
                       isLive: isLive,
                       // AE#440: the join tail, opt-in. The host itself gates this on `isLive`.
                       liveJoinStartsImmediately: loadedOptions.liveJoinStartsImmediately,
+                      forwardBufferDuration: loopbackForwardBufferDuration,
                       // AE#520: the session knows whether the bitstream it stream-copied carries JOC;
                       // the HDMI route cannot, because Atmos passthrough and a stereo LPCM route
                       // report the same two channels.
@@ -3308,5 +3317,24 @@ extension AetherEngine {
                 }
             }
         }
+    }
+
+    // SVPlayer modification (2026-11-26): Compute VOD loopback AVPlayer preferredForwardBufferDuration
+    // proportionally inside the SegmentCache forward window (up to 24 s on Wi-Fi Auto, 4 s floor on
+    // tight/cellular-test windows and strictly 4 s on live) so ±10 s seeks hit AVPlayer's loaded buffer.
+    nonisolated static func resolvedLoopbackForwardBufferDuration(
+        isLive: Bool,
+        targetForwardBufferSeconds: Double?,
+        forwardBufferSegments: Int?
+    ) -> Double {
+        guard !isLive else { return 4.0 }
+        var ceiling: Double = 24.0
+        if let targetSeconds = targetForwardBufferSeconds, targetSeconds.isFinite, targetSeconds > 0 {
+            ceiling = min(ceiling, max(4.0, targetSeconds * 0.4))
+        }
+        if let segments = forwardBufferSegments, segments > 0 {
+            ceiling = min(ceiling, max(4.0, Double(segments) * HLSVideoEngine.targetSegmentDuration * 0.4))
+        }
+        return max(4.0, ceiling)
     }
 }
