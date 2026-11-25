@@ -1,4 +1,7 @@
 // Modified by SVPlayer on 2026-11-20.
+// SVPlayer modification (2026-11-25): Staged stream-info probe budgets, auxiliary stream
+// parking, soft probe timeout guard, server MediaStreams hint backfilling, and deferred
+// packet-time codec parameter completion.
 import Foundation
 import AetherLibavformat
 import AetherLibavcodec
@@ -118,6 +121,20 @@ struct DemuxerOpenProfile: Sendable {
     /// playback open, so the probe, the HLS producer's own open and every rebuild agree; off for the
     /// disposable still extractor.
     var auditsRecordlessDolbyVision: Bool = true
+
+    // SVPlayer modification (2026-11-25): Tolerant stream-info probe controls & upstream MediaStreams hints.
+    var streamHints: DemuxerMediaHints? = nil
+    var tolerantStreamInfo: Bool = true
+    var probeStage1Probesize: Int64? = nil
+    var probeStage1MaxAnalyzeDuration: Int64? = nil
+    var probeSoftWallClockTimeout: TimeInterval? = nil
+    var primaryReadyGraceSeconds: TimeInterval? = nil
+
+    func withStreamHints(_ hints: DemuxerMediaHints?) -> DemuxerOpenProfile {
+        var copy = self
+        copy.streamHints = hints
+        return copy
+    }
 
     /// A copy of `self` under a different reader name, for two call sites that share a profile.
     func withReaderLabel(_ label: String) -> DemuxerOpenProfile {
@@ -348,6 +365,12 @@ public final class Demuxer: @unchecked Sendable {
     private var closeRequested = false
     private var isCloseRequested: Bool { closeRequestLock.withLock { closeRequested } }
     private var openProfile: DemuxerOpenProfile = .playback
+    // SVPlayer modification (2026-11-25): Track live mode, upstream MediaStreams hints, tolerant
+    // probe degradation state, and streams awaiting deferred packet-time parameter completion.
+    private var openIsLive: Bool = false
+    private var activeStreamHints: DemuxerMediaHints?
+    private(set) var tolerantProbeDegraded: Bool = false
+    private(set) var streamsAwaitingDeferredParams: Set<Int32> = []
     var restrictToProvidedIO = false
 
     /// Audit NAT-7: the stream pointers `stream(at:)` hands out, copied out of `formatContext`
@@ -754,6 +777,11 @@ public final class Demuxer: @unchecked Sendable {
     func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
         if isCloseRequested { throw DemuxerError.openFailed(code: -1) }
         self.openProfile = profile
+        // SVPlayer modification (2026-11-25): Capture live flag and URL-scoped server MediaStreams hints.
+        self.openIsLive = isLive
+        self.activeStreamHints = profile.streamHints ?? DemuxerStreamHintRegistry.hints(for: url)
+        self.tolerantProbeDegraded = false
+        self.streamsAwaitingDeferredParams = []
         beginOpenTiming()
         self.auditSource = isLive ? nil : (url, extraHeaders)
         let isHTTP = ["http", "https"].contains(url.scheme?.lowercased() ?? "")
@@ -815,6 +843,11 @@ public final class Demuxer: @unchecked Sendable {
     func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil, discCacheKey: String? = nil) throws {
         if isCloseRequested { throw DemuxerError.openFailed(code: -1) }
         self.openProfile = profile
+        // SVPlayer modification (2026-11-25): Capture live flag and profile-provided MediaStreams hints.
+        self.openIsLive = isLive
+        self.activeStreamHints = profile.streamHints
+        self.tolerantProbeDegraded = false
+        self.streamsAwaitingDeferredParams = []
         beginOpenTiming()
         self.auditSource = nil
         // A controlled probe hands the folder in behind its counting wrapper, which hides the conformance.
@@ -1201,8 +1234,15 @@ public final class Demuxer: @unchecked Sendable {
     /// Default 5 MB/5s budgets miss sparse PGS/DVB tracks on 10-20 GB Blu-ray rips.
     /// 50 MB/60 s ensures codec params are populated without noticeably slowing open.
     private func applyProbeBudget(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
-        ctx.pointee.probesize = openProfile.probesize
-        ctx.pointee.max_analyze_duration = openProfile.maxAnalyzeDuration
+        // SVPlayer modification (2026-11-25): Start at Stage 1's narrowed budget so opening and
+        // initial stream probing never scan 50 MiB / 60 s unconditionally on incomplete streams.
+        let plan = StreamInfoTolerance.makeStagePlan(
+            profile: openProfile,
+            isLive: openIsLive,
+            hasProbeControl: probeControl != nil
+        )
+        ctx.pointee.probesize = plan.stage1Probesize
+        ctx.pointee.max_analyze_duration = plan.stage1MaxAnalyzeDuration
         // Installed unconditionally: a local input's URLContext copies the callback at open, so the
         // input byte budget could not reach it later.
         ctx.pointee.interrupt_callback = AVIOInterruptCB(
@@ -1319,11 +1359,17 @@ public final class Demuxer: @unchecked Sendable {
 
     private func probeStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>) throws {
         unresolvableAudioStreams = []
+        tolerantProbeDegraded = false
+        streamsAwaitingDeferredParams = []
         // #87: the subtitle side demuxer opts out of find_stream_info. avformat_open_input already
         // carries codec_id / codec_type for every subtitle track (container header / PMT), and
         // reclassifyAttachedPictures only exists to bound the find_stream_info cost, so both are skipped.
         // The reader runs `resolveStreamInfo()` on demand if its target stream's codec is unresolved.
         guard !openProfile.skipStreamInfo else {
+            if let hints = activeStreamHints {
+                _ = StreamInfoTolerance.backfillMissingParameters(in: ctx, from: hints)
+            }
+            streamsAwaitingDeferredParams = StreamInfoTolerance.streamsNeedingDeferredCompletion(in: ctx)
             logStreams(ctx)
             return
         }
@@ -1332,21 +1378,141 @@ public final class Demuxer: @unchecked Sendable {
         let parked = parkUnresolvableAudio(ctx)
         let parkedPGS = parkPGSSubtitles(ctx)
         let parkedData = parkUnnamedDataStreams(ctx)
+        // SVPlayer modification (2026-11-25): Park incomplete/sparse auxiliary streams (DVB/DVD/unknown
+        // subtitles, unknown/data tracks, broken secondary tracks) before Stage 1, run staged
+        // find_stream_info with a soft wall-clock & primary-ready guard, and degrade tolerantly
+        // with server MediaStreams hint backfill + deferred packet-time parameter completion.
+        let parkedAux = openProfile.tolerantStreamInfo
+            ? StreamInfoTolerance.parkAuxiliaryStreamsForStage1(ctx)
+            : []
+
+        let plan = StreamInfoTolerance.makeStagePlan(
+            profile: openProfile,
+            isLive: openIsLive,
+            hasProbeControl: probeControl != nil
+        )
+        ctx.pointee.probesize = min(ctx.pointee.probesize, plan.stage1Probesize)
+        ctx.pointee.max_analyze_duration = min(ctx.pointee.max_analyze_duration, plan.stage1MaxAnalyzeDuration)
+
         let bytesBefore = ctx.pointee.pb?.pointee.bytes_read ?? 0
         let callStart = DispatchTime.now().uptimeNanoseconds
+
         interrupt.armHeaderWait(ctx, startedAt: callStart)
+        if openProfile.tolerantStreamInfo {
+            interrupt.armProbeGuard(
+                ctx,
+                startedAt: callStart,
+                softTimeoutSeconds: plan.stage1SoftTimeoutSeconds,
+                primaryReadyGraceSeconds: plan.primaryReadyGraceSeconds,
+                videoOnlyReadyGraceSeconds: plan.videoOnlyReadyGraceSeconds
+            )
+        }
+        let armedDeadline = openProfile.tolerantStreamInfo && probeControl == nil && plan.stage1SoftTimeoutSeconds != nil
+        if armedDeadline, let softTimeout = plan.stage1SoftTimeoutSeconds {
+            avioProvider?.beginReadDeadline(secondsFromNow: softTimeout)
+        }
+        // Call `avformat_find_stream_info` at most ONCE per AVFormatContext (re-entering it after
+        // libavformat frees internal stream probe info causes undefined behavior on MPEG-TS).
         let findRet = avformat_find_stream_info(ctx, nil)
+        let anyDeadlineFired = armedDeadline && (avioProvider?.readDeadlineFired ?? false)
+        if armedDeadline {
+            avioProvider?.endReadDeadline()
+        }
+        let guardVerdict = interrupt.disarmProbeGuard()
         let headerWaitReleasedAfter = interrupt.disarmHeaderWait()
         let callReturn = DispatchTime.now().uptimeNanoseconds
+
+        StreamInfoTolerance.unparkStreams(ctx, parkedAux)
         unparkUnresolvableAudio(ctx, parked)
         unparkPGSSubtitles(ctx, parkedPGS)
         unparkUnnamedDataStreams(ctx, parkedData)
+
+        let wasSoftInterrupted = (guardVerdict != .keepProbing) || anyDeadlineFired
+        let abortedByHost = isCloseRequested || (probeControl?.isStopped == true)
+
+        // If our soft guard / read deadline interrupted a read mid-stream, clear latched AVIO error
+        // state and cleanly reset seekable containers to byte/time 0 so playback reads clean packets.
+        if openProfile.tolerantStreamInfo, !abortedByHost, (wasSoftInterrupted || findRet < 0) {
+            accessLock.lock()
+            clearLatchedReadStateLocked(ctx)
+            if wasSoftInterrupted, isSourceSeekable, ctx.pointee.pb != nil {
+                let seekRet = avformat_seek_file(ctx, -1, Int64.min, 0, Int64.max, 0)
+                if seekRet < 0 {
+                    _ = avformat_seek_file(ctx, -1, 0, 0, 0, AVSEEK_FLAG_BYTE)
+                }
+                avformat_flush(ctx)
+                clearLatchedReadStateLocked(ctx)
+            }
+            accessLock.unlock()
+        }
+
+        // Non-destructive backfill from server PlaybackInfo MediaStreams hints (e.g. Jellyfin/Emby).
+        if let hints = activeStreamHints {
+            let enriched = StreamInfoTolerance.backfillMissingParameters(in: ctx, from: hints)
+            if enriched > 0 {
+                EngineLog.emit(
+                    "[Demuxer] backfilled missing codec parameters on \(enriched) stream(s) from server MediaStreams hints",
+                    category: .demux
+                )
+            }
+        }
+
+        // Stage 2: If primary video/audio still lacks essential codecpar (e.g. mid-GOP MPEG-TS with
+        // a late first IDR/SPS past Stage 1's 8 s window), run a bounded pure-Swift `av_read_frame`
+        // in-band bitstream scan instead of re-entering `avformat_find_stream_info`.
+        streamsAwaitingDeferredParams = StreamInfoTolerance.streamsNeedingDeferredCompletion(in: ctx)
+        if openProfile.tolerantStreamInfo,
+           !abortedByHost,
+           !wasSoftInterrupted,
+           plan.hasStage2Scan,
+           !streamsAwaitingDeferredParams.isEmpty {
+            let primaryVideo = StreamInfoTolerance.tolerantBestVideoStreamIndex(in: ctx)
+            let primaryAudio = StreamInfoTolerance.tolerantBestAudioStreamIndex(in: ctx)
+            let needsPrimaryScan = (primaryVideo >= 0 && streamsAwaitingDeferredParams.contains(primaryVideo))
+                || (primaryAudio >= 0 && streamsAwaitingDeferredParams.contains(primaryAudio))
+            if needsPrimaryScan {
+                peekInBandParametersIfNeeded(
+                    ctx,
+                    primaryVideo: primaryVideo,
+                    primaryAudio: primaryAudio,
+                    maxPackets: plan.stage2ScanMaxPackets,
+                    maxBytes: plan.stage2ScanMaxBytes,
+                    maxSeconds: plan.stage2ScanMaxSeconds
+                )
+                streamsAwaitingDeferredParams = StreamInfoTolerance.streamsNeedingDeferredCompletion(in: ctx)
+            }
+        }
+
         probeReport = makeProbeReport(ctx, parkedAudio: parked, bytesBefore: bytesBefore,
                                       callStart: callStart, callReturn: callReturn,
                                       headerWaitReleasedAfter: headerWaitReleasedAfter)
-        guard findRet >= 0 else {
-            emitOpenTimings(outcome: "find_stream_info failed (\(findRet))")
-            throw DemuxerError.streamInfoFailed(code: findRet)
+
+        let finalReadiness = StreamInfoTolerance.evaluateReadiness(ctx)
+        if findRet < 0 {
+            let canDegrade = openProfile.tolerantStreamInfo
+                && !abortedByHost
+                && (finalReadiness.isPrimaryPlayable || finalReadiness.hasKnownCodecMediaStream)
+            if canDegrade {
+                tolerantProbeDegraded = true
+                EngineLog.emit(
+                    "[Demuxer] tolerant probe recovery: avformat_find_stream_info returned \(findRet) "
+                    + "(guard=\(guardVerdict), deadline=\(anyDeadlineFired), primaryReady=\(finalReadiness.isPrimaryPlayable), "
+                    + "deferredStreams=\(streamsAwaitingDeferredParams.sorted())); continuing playback with available tracks",
+                    category: .demux
+                )
+            } else {
+                emitOpenTimings(outcome: "find_stream_info failed (\(findRet))")
+                throw DemuxerError.streamInfoFailed(code: findRet)
+            }
+        } else if wasSoftInterrupted || !streamsAwaitingDeferredParams.isEmpty || !parkedAux.isEmpty {
+            if wasSoftInterrupted || !streamsAwaitingDeferredParams.isEmpty {
+                tolerantProbeDegraded = true
+            }
+            EngineLog.emit(
+                "[Demuxer] stream-info tolerance summary: guard=\(guardVerdict), deadline=\(anyDeadlineFired), "
+                + "parkedAux=\(parkedAux.count), deferredStreams=\(streamsAwaitingDeferredParams.sorted())",
+                category: .demux
+            )
         }
         logStreams(ctx)
         armBluRayDolbyVisionLayers(ctx)
@@ -1357,11 +1523,104 @@ public final class Demuxer: @unchecked Sendable {
         }
         armGeneratedPTSSuppression(ctx)
         if openProfile.auditsRecordlessDolbyVision, let source = auditSource {
-            let idx = av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
+            let idx = StreamInfoTolerance.tolerantBestVideoStreamIndex(in: ctx)
             if idx >= 0, let codecpar = ctx.pointee.streams[Int(idx)]?.pointee.codecpar {
                 DolbyVisionRecordAudit.addRecordIfProfile5(
                     codecpar: codecpar, url: source.url, extraHeaders: source.headers)
             }
+        }
+    }
+
+    // SVPlayer modification (2026-11-25): Bounded, lossless in-band packet peek when a tolerant
+    // probe leaves primary video/audio codecpar incomplete. Every read packet is retained in
+    // `peekedPackets` so playback loses zero frames even on non-seekable streams.
+    private func peekInBandParametersIfNeeded(
+        _ ctx: UnsafeMutablePointer<AVFormatContext>,
+        primaryVideo: Int32,
+        primaryAudio: Int32,
+        maxPackets: Int = 96,
+        maxBytes: Int = 4 * 1024 * 1024,
+        maxSeconds: TimeInterval = 1.5
+    ) {
+        let armDeadline = probeControl == nil
+        if armDeadline {
+            avioProvider?.beginReadDeadline(secondsFromNow: maxSeconds)
+        }
+        defer {
+            if armDeadline {
+                let fired = avioProvider?.readDeadlineFired ?? false
+                avioProvider?.endReadDeadline()
+                if fired {
+                    accessLock.lock()
+                    clearLatchedReadStateLocked(ctx)
+                    accessLock.unlock()
+                }
+            }
+        }
+
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        let maxNs = UInt64(max(0.1, maxSeconds) * 1_000_000_000)
+        var bytesScanned = 0
+        let retainPacketCap = 128
+        var spilledPastRetainCap = false
+
+        accessLock.lock()
+        defer { accessLock.unlock() }
+
+        for _ in 0..<maxPackets {
+            if isCloseRequested || probeControl?.isStopped == true { break }
+            if !isSourceSeekable && peekedPackets.count >= retainPacketCap { break }
+            let elapsed = DispatchTime.now().uptimeNanoseconds &- startNs
+            if elapsed >= maxNs || bytesScanned >= maxBytes { break }
+
+            var pkt: UnsafeMutablePointer<AVPacket>? = trackedPacketAlloc()
+            guard let packet = pkt else { break }
+            let ret = av_read_frame(ctx, packet)
+            if ret < 0 {
+                trackedPacketFree(&pkt)
+                clearLatchedReadStateLocked(ctx)
+                break
+            }
+            bytesScanned += max(0, Int(packet.pointee.size))
+            let si = packet.pointee.stream_index
+            if streamsAwaitingDeferredParams.contains(si),
+               si >= 0, si < Int32(ctx.pointee.nb_streams),
+               let stream = ctx.pointee.streams[Int(si)] {
+                if StreamInfoTolerance.applyDeferredPacketParameters(packet: packet, to: stream) {
+                    streamsAwaitingDeferredParams = StreamInfoTolerance.streamsNeedingDeferredCompletion(in: ctx)
+                }
+            }
+            if !spilledPastRetainCap && peekedPackets.count < retainPacketCap {
+                peekedPackets.append(packet)
+            } else if isSourceSeekable {
+                // On seekable sources scanning deeper for a late keyframe (>128 packets), avoid
+                // holding thousands of packets in RAM and cleanly rewind back to 0 when finished.
+                if !spilledPastRetainCap {
+                    dropPeekedPacketsLocked()
+                    spilledPastRetainCap = true
+                }
+                trackedPacketFree(&pkt)
+            } else {
+                // Non-seekable stream: stop before dropping packets we cannot replay.
+                trackedPacketFree(&pkt)
+                break
+            }
+
+            let videoDone = primaryVideo < 0 || !streamsAwaitingDeferredParams.contains(primaryVideo)
+            let audioDone = primaryAudio < 0 || !streamsAwaitingDeferredParams.contains(primaryAudio)
+            if videoDone && audioDone {
+                break
+            }
+        }
+
+        if spilledPastRetainCap, isSourceSeekable {
+            clearLatchedReadStateLocked(ctx)
+            let seekRet = avformat_seek_file(ctx, -1, Int64.min, 0, Int64.max, 0)
+            if seekRet < 0 {
+                _ = avformat_seek_file(ctx, -1, 0, 0, 0, AVSEEK_FLAG_BYTE)
+            }
+            avformat_flush(ctx)
+            clearLatchedReadStateLocked(ctx)
         }
     }
 
@@ -1959,12 +2218,15 @@ public final class Demuxer: @unchecked Sendable {
             let dur = ctx.pointee.duration
             return dur > 0 ? Double(dur) / Double(AV_TIME_BASE) : 0
         }()
-        // Declared (sequential-origin caller trust) > custom reader > disc MPLS/IFO (AE#105) > container.
+        // SVPlayer modification (2026-11-25): Fall back to server MediaStreams duration hint when
+        // an incomplete container header omits duration.
+        let containerOrHint = container > 0 ? container : (activeStreamHints?.durationSeconds ?? 0)
+        // Declared (sequential-origin caller trust) > custom reader > disc MPLS/IFO (AE#105) > container > server hint.
         return Self.effectiveDurationSeconds(
             declared: openProfile.declaredDurationSeconds,
             readerDuration: (avioProvider as? CustomIOReaderBridge)?.timeSeekableReader?.mediaDuration,
             discTitle: selectedDiscTitleDurationSeconds,
-            container: container)
+            container: containerOrHint)
     }
 
     /// AVFormatContext.bit_rate in bps, or 0 if unknown. Used by
@@ -2071,7 +2333,16 @@ public final class Demuxer: @unchecked Sendable {
 
     private static func bestStreamIndex(_ ctx: UnsafeMutablePointer<AVFormatContext>,
                                         _ type: AVMediaType) -> Int32 {
-        max(-1, av_find_best_stream(ctx, type, -1, -1, nil, 0))
+        // SVPlayer modification (2026-11-25): Tolerate incomplete codecpar when selecting primary
+        // video/audio tracks while skipping broken AV_CODEC_ID_NONE auxiliary streams.
+        switch type {
+        case AVMEDIA_TYPE_VIDEO:
+            return StreamInfoTolerance.tolerantBestVideoStreamIndex(in: ctx)
+        case AVMEDIA_TYPE_AUDIO:
+            return StreamInfoTolerance.tolerantBestAudioStreamIndex(in: ctx)
+        default:
+            return max(-1, av_find_best_stream(ctx, type, -1, -1, nil, 0))
+        }
     }
 
     /// The best video stream; for a split Dolby Vision source always the base layer, which libavformat's own score
@@ -2974,7 +3245,21 @@ public final class Demuxer: @unchecked Sendable {
             guard let code = Self.readFailureCode(ret, closeRequested: isCloseRequested) else { return nil }
             throw DemuxerError.readFailed(code: code)
         }
-        if let pkt = packet { boundTimestampsLocked(pkt) }
+        if let pkt = packet {
+            // SVPlayer modification (2026-11-25): Dynamically backfill missing codecpar fields as
+            // packets arrive for streams that started under tolerant probe degradation.
+            if !streamsAwaitingDeferredParams.isEmpty {
+                let si = pkt.pointee.stream_index
+                if streamsAwaitingDeferredParams.contains(si),
+                   si >= 0, si < Int32(ctx.pointee.nb_streams),
+                   let st = ctx.pointee.streams[Int(si)],
+                   StreamInfoTolerance.applyDeferredPacketParameters(packet: pkt, to: st) {
+                    streamsAwaitingDeferredParams = StreamInfoTolerance.streamsNeedingDeferredCompletion(in: ctx)
+                    refreshStreamTableLocked(rebuildTracks: true)
+                }
+            }
+            boundTimestampsLocked(pkt)
+        }
         // #407: before anything reads a timestamp off this packet. The PTS on these streams was
         // invented by `+genpts` out of decode order and transposes every B/P pair; dropping it leaves
         // the decoder's own reorder to place the picture. See `VFWDecodeOrderPTSRepair`.
@@ -3827,6 +4112,11 @@ public final class Demuxer: @unchecked Sendable {
         avioProvider?.markClosed()  // unblocks av_read_frame (tvOS suspends threads in background)
         accessLock.lock()
         interrupt.disarmInputCeiling()
+        // SVPlayer modification (2026-11-25): Reset tolerant probe state on close.
+        // (`probeGuard` is strictly demux-thread confined inside `probeStreams`, like `headerWait`.)
+        activeStreamHints = nil
+        tolerantProbeDegraded = false
+        streamsAwaitingDeferredParams.removeAll()
         // Audit DMX-108: the table is emptied BEFORE the streams are freed, and close waits for
         // every `withStream` caller already inside, so no thread is left holding a freed `AVStream*`.
         streamTableLock.lock()
@@ -4015,6 +4305,35 @@ private final class DemuxInterrupt: @unchecked Sendable {
         ceiling = .max
     }
 
+    // SVPlayer modification (2026-11-25): Soft probe guard armed exclusively around staged
+    // `avformat_find_stream_info` calls on the demux thread to cap wall-clock hang time and
+    // stop scanning once primary video/audio tracks are already resolved.
+    private var probeGuardContext: UnsafeMutablePointer<AVFormatContext>?
+    private var probeGuardState: StreamInfoTolerance.ProbeGuardState?
+
+    func armProbeGuard(
+        _ ctx: UnsafeMutablePointer<AVFormatContext>,
+        startedAt: UInt64,
+        softTimeoutSeconds: TimeInterval?,
+        primaryReadyGraceSeconds: TimeInterval,
+        videoOnlyReadyGraceSeconds: TimeInterval
+    ) {
+        probeGuardContext = ctx
+        probeGuardState = StreamInfoTolerance.ProbeGuardState(
+            startedAtNs: startedAt,
+            softTimeoutSeconds: softTimeoutSeconds,
+            primaryReadyGraceSeconds: primaryReadyGraceSeconds,
+            videoOnlyReadyGraceSeconds: videoOnlyReadyGraceSeconds
+        )
+    }
+
+    func disarmProbeGuard() -> StreamInfoTolerance.GuardVerdict {
+        let verdict = probeGuardState?.triggerReason ?? .keepProbing
+        probeGuardContext = nil
+        probeGuardState = nil
+        return verdict
+    }
+
     func shouldInterrupt() -> Bool {
         if isCloseRequested { return true }
         if probeControl?.isStopped == true { return true }
@@ -4023,6 +4342,17 @@ private final class DemuxInterrupt: @unchecked Sendable {
             return true
         }
         releaseHeaderWaitIfDue()
+        if let ctx = probeGuardContext, var guardState = probeGuardState {
+            let readiness = StreamInfoTolerance.evaluateReadiness(ctx)
+            let verdict = guardState.evaluate(
+                nowNs: DispatchTime.now().uptimeNanoseconds,
+                readiness: readiness
+            )
+            probeGuardState = guardState
+            if verdict != .keepProbing {
+                return true
+            }
+        }
         return false
     }
 }

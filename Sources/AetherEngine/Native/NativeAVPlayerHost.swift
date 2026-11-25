@@ -132,6 +132,15 @@ final class NativeAVPlayerHost {
     /// duration, and publishing that transient would bounce the engine through `.paused` and back for
     /// what the viewer must not even notice; the real status is republished when the recovery settles.
     private var prematureEndRecoveryInFlight = false
+    // SVPlayer modification (2026-11-25): Post-seek spurious-pause recovery guard for cloud-drive
+    // loopback playback. On slow/variable-latency Range origins, AVPlayer can transiently drop to
+    // timeControlStatus == .paused during or right after a seek without posting playbackStalled;
+    // re-assert play() within this bounded window whenever playIntent is still true and not near EOF.
+    private var seekPlayResumeWindowUntil: DispatchTime?
+    private var seekPlayResumeReasserts: Int = 0
+    private var lastSeekTargetSeconds: Double?
+    nonisolated static let seekPlayResumeWindowSeconds: TimeInterval = 8.0
+    nonisolated static let maxSeekPlayResumeReasserts: Int = 3
     /// AE#962: the highest clock the observer published since the last seek, and when (uptime ns).
     private var publishedClockPeak: (seconds: Double, uptimeNanos: UInt64)?
 
@@ -907,6 +916,39 @@ final class NativeAVPlayerHost {
                 guard let self, self.sessionID == sid else { return }
                 // AE#287: swallow the pause AVPlayer takes while a premature-end recovery re-seeks.
                 if status == .paused, self.prematureEndRecoveryInFlight { return }
+                // SVPlayer modification (2026-11-25): Swallow transient AVPlayer .paused dips
+                // during or immediately after a playing seek (e.g. cloud-drive range refill lag)
+                // and re-assert play() instead of latching the engine into .paused.
+                if status == .paused {
+                    let withinWindow = self.seekPlayResumeWindowUntil.map { DispatchTime.now() < $0 } ?? false
+                    let nearEnd = Self.isNearEndOfVOD(
+                        target: self.lastSeekTargetSeconds ?? self.currentTime,
+                        duration: self.duration,
+                        isLive: self.isLiveSession
+                    )
+                    if Self.shouldReassertPlayOnSeekPause(
+                        playIntent: self.playIntent,
+                        seekInFlight: self.seekInFlight,
+                        withinResumeWindow: withinWindow,
+                        reassertsUsed: self.seekPlayResumeReasserts,
+                        didReachEnd: self.didReachEnd,
+                        isNearEnd: nearEnd,
+                        isReady: self.playerItem?.status == .readyToPlay
+                    ) {
+                        self.seekPlayResumeReasserts += 1
+                        EngineLog.emit(
+                            "[NativeAVPlayerHost] #\(sid) transient pause during/after seek "
+                            + "(attempt \(self.seekPlayResumeReasserts)/\(Self.maxSeekPlayResumeReasserts)); "
+                            + "re-asserting play()",
+                            category: .engine
+                        )
+                        self.avPlayer.play()
+                        return
+                    }
+                } else if status == .playing, !self.seekInFlight {
+                    self.seekPlayResumeWindowUntil = nil
+                    self.seekPlayResumeReasserts = 0
+                }
                 self.waitingReason = waitingReason.map(AVPlayer.WaitingReason.init(rawValue:))
                 self.timeControlStatus = status
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
@@ -1029,6 +1071,9 @@ final class NativeAVPlayerHost {
                 // audio-only tail still ahead. Recover before `.ended` latches; it is terminal.
                 if await self.recoverFromPrematureEnd() { return }
                 guard self.sessionID == sid else { return }
+                // SVPlayer modification (2026-11-25): Terminal end disarms post-seek play recovery.
+                self.seekPlayResumeWindowUntil = nil
+                self.seekPlayResumeReasserts = 0
                 self.didReachEnd = true
             }
         }
@@ -1057,15 +1102,27 @@ final class NativeAVPlayerHost {
                 let tcs = self.avPlayer.timeControlStatus
                 let ready = self.playerItem?.status == .readyToPlay
                 let old = self.playIntent
+                // SVPlayer modification (2026-11-25): Preserve playIntent across seekInFlight so
+                // transient rate=0 echoes during AVPlayer seek flush/rebuffer never flip intent.
                 let intent = (self.prematureEndRecoveryInFlight || !ready)
                     ? old
-                    : Self.playIntentAfterRateChange(reason: reason, rate: rate, current: old, timeControlStatus: tcs)
+                    : Self.playIntentAfterRateChange(
+                        reason: reason,
+                        rate: rate,
+                        current: old,
+                        timeControlStatus: tcs,
+                        seekInFlight: self.seekInFlight
+                    )
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(sid) rate change reason=\(reason?.rawValue ?? "nil") "
                     + "rate=\(rate) ready=\(ready) play intent \(old) -> \(intent)",
                     category: .engine
                 )
                 self.playIntent = intent
+                if old && !intent {
+                    self.seekPlayResumeWindowUntil = nil
+                    self.seekPlayResumeReasserts = 0
+                }
             }
         }
         notificationObservers.append(rateObs)
@@ -1212,16 +1269,43 @@ final class NativeAVPlayerHost {
     // SVPlayer modification (2026-11-24): While automaticallyWaitsToMinimizeStalling holds AVPlayer in
     // .waitingToPlayAtSpecifiedRate, avPlayer.rate reads 0.0 even after play() was called. Keep `current`
     // playIntent during buffering waits so in-flight audio-shaping / session reloads never drop playIntent.
+    // SVPlayer modification (2026-11-25): Also keep `current` playIntent while `seekInFlight` is true
+    // so AVPlayer's seek-flush rate=0 notification cannot drop playIntent mid-seek (explicit `pause()`
+    // sets `playIntent = false` directly before calling `avPlayer.pause()`).
     nonisolated static func playIntentAfterRateChange(
         reason: AVPlayer.RateDidChangeReason?,
         rate: Float,
         current: Bool,
-        timeControlStatus: AVPlayer.TimeControlStatus? = nil
+        timeControlStatus: AVPlayer.TimeControlStatus? = nil,
+        seekInFlight: Bool = false
     ) -> Bool {
         guard reason == .setRateCalled else { return current }
         if rate != 0 { return true }
-        if timeControlStatus == .waitingToPlayAtSpecifiedRate { return current }
+        if seekInFlight || timeControlStatus == .waitingToPlayAtSpecifiedRate { return current }
         return false
+    }
+
+    // SVPlayer modification (2026-11-25): Pure helpers for post-seek spurious-pause recovery.
+    nonisolated static func isNearEndOfVOD(target: Double, duration: Double, isLive: Bool) -> Bool {
+        !isLive && duration.isFinite && duration > 0 && target.isFinite && target >= max(0, duration - 0.5)
+    }
+
+    nonisolated static func shouldReassertPlayOnSeekPause(
+        playIntent: Bool,
+        seekInFlight: Bool,
+        withinResumeWindow: Bool,
+        reassertsUsed: Int,
+        maxReasserts: Int = maxSeekPlayResumeReasserts,
+        didReachEnd: Bool,
+        isNearEnd: Bool,
+        isReady: Bool
+    ) -> Bool {
+        playIntent
+            && isReady
+            && !didReachEnd
+            && !isNearEnd
+            && (seekInFlight || withinResumeWindow)
+            && reassertsUsed < maxReasserts
     }
 
     /// #50: AVPlayer fires .failed for self-healing transients (loopback 404, AVIOReader reconnect) while playback advances uninterrupted (rrgomes: tcs=playing at .failed).
@@ -2071,6 +2155,9 @@ final class NativeAVPlayerHost {
 
     func pause() {
         playIntent = false
+        // SVPlayer modification (2026-11-25): Explicit pause immediately cancels seek resume recovery.
+        seekPlayResumeWindowUntil = nil
+        seekPlayResumeReasserts = 0
         avPlayer.pause()
     }
 
@@ -2256,6 +2343,17 @@ final class NativeAVPlayerHost {
         // AE#629: this seek's own landing publishes the clock from here on.
         mountSeekPending = false
         latestSeekRenderedTimePublished = false
+        // SVPlayer modification (2026-11-25): Arm bounded post-seek play recovery only when seeking
+        // from a playing state away from VOD EOF; paused seeks must remain paused.
+        lastSeekTargetSeconds = seconds
+        let nearEnd = Self.isNearEndOfVOD(target: seconds, duration: duration, isLive: isLiveSession)
+        if playIntent && !didReachEnd && !nearEnd {
+            seekPlayResumeWindowUntil = DispatchTime.now() + .milliseconds(Int(Self.seekPlayResumeWindowSeconds * 1000))
+            seekPlayResumeReasserts = 0
+        } else {
+            seekPlayResumeWindowUntil = nil
+            seekPlayResumeReasserts = 0
+        }
         let resumeGuard = SeekResumeGuard()
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             if let deadlineSeconds, deadlineSeconds > 0 {
@@ -2299,6 +2397,32 @@ final class NativeAVPlayerHost {
                                 self.latestSeekRenderedTimePublished = true
                                 self.renderedTime = actual
                             }
+                        }
+                        // SVPlayer modification (2026-11-25): Refresh the post-seek recovery window
+                        // on landing and re-assert play() before resuming the continuation if AVPlayer
+                        // landed in .paused despite playIntent == true (so AetherEngine's
+                        // reconcileNativeSeekTransport never latches .paused on a playing seek).
+                        let landedNearEnd = Self.isNearEndOfVOD(
+                            target: actual.isFinite ? actual : seconds,
+                            duration: self.duration,
+                            isLive: self.isLiveSession
+                        )
+                        if self.playIntent && !self.didReachEnd && !landedNearEnd {
+                            self.seekPlayResumeWindowUntil = DispatchTime.now()
+                                + .milliseconds(Int(Self.seekPlayResumeWindowSeconds * 1000))
+                            if self.avPlayer.timeControlStatus == .paused,
+                               self.seekPlayResumeReasserts < Self.maxSeekPlayResumeReasserts {
+                                self.seekPlayResumeReasserts += 1
+                                EngineLog.emit(
+                                    "[NativeAVPlayerHost] seek completion landed paused with playIntent=true; "
+                                    + "re-asserting play() (attempt \(self.seekPlayResumeReasserts))",
+                                    category: .engine
+                                )
+                                self.avPlayer.play()
+                            }
+                        } else {
+                            self.seekPlayResumeWindowUntil = nil
+                            self.seekPlayResumeReasserts = 0
                         }
                     }
                     EngineLog.emit("[NativeAVPlayerHost] seek completion target=\(String(format: "%.2f", seconds)) actual=\(String(format: "%.2f", actual)) finished=\(finished) landed=\(landed) current=\(gen == self.seekGeneration)", category: .engine)
@@ -2377,6 +2501,18 @@ final class NativeAVPlayerHost {
                 // until the engine finalizes and mirror what the completion would publish.
                 seekInFlight = false
                 if rendered.isFinite { currentTime = rendered }
+                // SVPlayer modification (2026-11-25): Re-assert play() if AVPlayer parked at
+                // .paused on slow-source pending seek landing while playIntent is still true.
+                let landedNearEnd = Self.isNearEndOfVOD(
+                    target: rendered.isFinite ? rendered : seconds,
+                    duration: duration,
+                    isLive: isLiveSession
+                )
+                if playIntent && !didReachEnd && !landedNearEnd && avPlayer.timeControlStatus == .paused
+                    && seekPlayResumeReasserts < Self.maxSeekPlayResumeReasserts {
+                    seekPlayResumeReasserts += 1
+                    avPlayer.play()
+                }
                 return true
             }
         }
@@ -2396,6 +2532,11 @@ final class NativeAVPlayerHost {
     func setRate(_ value: Float) {
         // Non-zero rate counts as play intent (must survive replaceCurrentItem swap like play() does).
         playIntent = (value != 0)
+        // SVPlayer modification (2026-11-25): Explicit zero rate disarms post-seek play recovery.
+        if value == 0 {
+            seekPlayResumeWindowUntil = nil
+            seekPlayResumeReasserts = 0
+        }
         // #436: `play()` is rate 1.0 by definition, and it is re-issued from paths no client can see:
         // the readyToPlay re-assert after an item swap, interruption and background resume, the #287
         // premature-end recovery, plus AVKit's own transport and the remote command centre calling
@@ -2692,6 +2833,10 @@ final class NativeAVPlayerHost {
         prematureEndRecoveryAttempts = 0
         lastPrematureEndRecoveryPlayhead = nil
         prematureEndRecoveryInFlight = false
+        // SVPlayer modification (2026-11-25): Clear post-seek recovery state on item unload.
+        seekPlayResumeWindowUntil = nil
+        seekPlayResumeReasserts = 0
+        lastSeekTargetSeconds = nil
         publishedClockPeak = nil
         didSampleSettledRoute = false
         // #168: a reused host must not report the prior session's dynamic range before the new item resolves.

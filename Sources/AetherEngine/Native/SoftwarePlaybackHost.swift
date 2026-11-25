@@ -2444,7 +2444,9 @@ final class SoftwarePlaybackHost {
         // right after load(), before the demux/feeder loop armed the clock, wedged the
         // delayed-rate-change machinery and froze live sessions on the first frame; the arming
         // seekClock picks up lastRate instead (#107).
-        if clockArmed {
+        // SVPlayer modification (2026-11-25): Also skip live clock rate writes while paused or
+        // seeking so speed updates do not start a paused clock or race an in-flight seek.
+        if clockArmed && isPlaying && !seekInFlight {
             audioOutput?.setRate(newRate)
         }
     }
@@ -2662,6 +2664,10 @@ final class SoftwarePlaybackHost {
         // during the reposition rewrite the stash, and a landing that ignored them either overrode the
         // pause (kept playing) or, from the other side, anchored at rate 0 under a running loop.
         if inFlightSeekResumeIntent {
+            // SVPlayer modification (2026-11-25): Clear any host pause latch and re-enable audio
+            // output before anchoring the clock so a playing seek always resumes cleanly.
+            pausedByHost = false
+            audioOutput?.setPlaybackEnabled(true)
             // Anchor clock at seek target: clock at .zero + PTS=seekTarget would stall rendering for seekTarget seconds (FigVideoQueueRemote -12080).
             audioOutput?.seekClock(to: targetTime, rate: lastRate)
             isPlaying = true

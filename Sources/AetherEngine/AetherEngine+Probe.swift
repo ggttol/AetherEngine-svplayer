@@ -1,3 +1,4 @@
+// SVPlayer modification (2026-11-25): Honor caller probe budgets in probeOpenProfile.
 import Foundation
 import CoreVideo
 import AVFoundation
@@ -324,7 +325,11 @@ extension AetherEngine {
     /// a Matroska file's fonts otherwise cost the probe their whole size, which is more than any byte
     /// budget sized for a header.
     private nonisolated static func probeOpenProfile(limits: ProbeLimits?, options: LoadOptions) -> DemuxerOpenProfile {
-        let base = DemuxerOpenProfile.playback.skippingAttachments(options.skipsContainerAttachments)
+        // SVPlayer modification (2026-11-25): Honor caller probesize/maxAnalyzeDuration on probe
+        // opens as well so slow/incomplete streams do not burn 50 MiB / 60 s unconditionally.
+        let base = DemuxerOpenProfile.playback
+            .withProbeBudget(probesize: options.probesize, maxAnalyzeDuration: options.maxAnalyzeDuration)
+            .skippingAttachments(options.skipsContainerAttachments)
         guard let limits else { return base }
         var profile = base
         // FFmpeg has a minimum probe size. The input seam still enforces smaller caller limits.

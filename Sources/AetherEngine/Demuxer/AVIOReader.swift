@@ -670,6 +670,59 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // one request per range boundary while the consumer keeps up, one per
     // highWater-to-lowWater drain cycle when the origin outruns it.
     static let persistentRangeBytes: Int64 = 32 * 1024 * 1024
+    // SVPlayer modification (2026-11-25): Size VOD seek and steady-state ranges to fit inside
+    // `winHighWater` headroom so fast cloud/proxy responses finish cleanly at `connRangeEnd`
+    // (preserving HTTP/1.1 Keep-Alive sockets) instead of being cancelled mid-body by backpressure.
+    static let seekInitialRangeBytes: Int64 = 8 * 1024 * 1024
+    static let minKeepAliveRangeBytes: Int64 = 4 * 1024 * 1024
+    static let seekKeepForwardLimitDefault: Int64 = 2 * 1024 * 1024
+    static let seekKeepForwardLimitRepositioned: Int64 = 512 * 1024
+    static let unreachableRangeDrainGraceBytes: Int64 = 256 * 1024
+
+    // SVPlayer modification (2026-11-25): Pure range sizing policy for VOD persistent requests.
+    static func vodPersistentRequestRangeBytes(
+        offset: Int64,
+        target: Int64,
+        fileSize: Int64,
+        winHighWater: Int,
+        keptUndrainedBytes: Int,
+        isSeek: Bool
+    ) -> Int64? {
+        if fileSize > 0, offset >= fileSize { return nil }
+        let overlapBytes = max(0, target - offset)
+        var desired = isSeek ? seekInitialRangeBytes : persistentRangeBytes
+        if winHighWater >= winLowWater {
+            let headroom = max(minKeepAliveRangeBytes, Int64(winHighWater) - Int64(max(0, keptUndrainedBytes)))
+            desired = min(desired, headroom + overlapBytes)
+        }
+        if fileSize > offset {
+            return min(desired, fileSize - offset)
+        }
+        return fileSize <= 0 ? desired : nil
+    }
+
+    // SVPlayer modification (2026-11-25): Pure forward-seek reconnect decision. Avoids stalling
+    // on an active bounded transfer whose `connRangeEnd` cannot reach `curPosition`, or draining
+    // megabytes of skipped data on a slow cloud CDN after a playback seek reposition.
+    static func shouldReconnectForForwardSeek(
+        curPosition: Int64,
+        frontier: Int64,
+        connRangeEnd: Int64?,
+        endedPlanned: Bool,
+        repositionedForPlayback: Bool
+    ) -> Bool {
+        guard curPosition > frontier else { return false }
+        if endedPlanned { return true }
+        let forwardLimit = repositionedForPlayback
+            ? seekKeepForwardLimitRepositioned
+            : seekKeepForwardLimitDefault
+        if curPosition > frontier + forwardLimit { return true }
+        if let rangeEnd = connRangeEnd, curPosition > rangeEnd {
+            let remainingInRange = rangeEnd - frontier + 1
+            return remainingInRange > unreachableRangeDrainGraceBytes
+        }
+        return false
+    }
 
     /// #377: the smallest window room worth a read on a held connection, and therefore the length
     /// of a dormant stretch in the steady state (this over media rate). #310's dose is that
@@ -2787,7 +2840,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
             let curPosition = position
             let repositionedForPlayback = playbackRepositionPending
-            if curPosition >= winStart { playbackRepositionPending = false }
+            // SVPlayer modification (2026-11-25): Only consume `playbackRepositionPending` once
+            // `curPosition` lands inside the resident window; forward seeks past `frontier` still
+            // need the flag so `shouldReconnectForForwardSeek` uses the tighter jump threshold.
+            if curPosition >= winStart, curPosition < winStart + Int64(window.count) {
+                playbackRepositionPending = false
+            }
 
             if curPosition < winStart {
                 winCond.unlock()
@@ -2964,8 +3022,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let endedByRangeEnd = connEndedAtRangeEnd
             let status = connStatus
             let retryAfter = connRetryAfter
+            let rangeEnd = connRangeEnd
 
-            if curPosition > frontier + Int64(Self.seekKeepForwardLimit) {
+            // SVPlayer modification (2026-11-25): Jump directly to `curPosition` on forward seeks
+            // past the bounded forward-keep threshold, past an unreachable active `connRangeEnd`,
+            // or after a planned connection end (`endedByBackpressure`/`endedByRangeEnd`), so we
+            // neither stall waiting for an unreachable range nor waste bandwidth draining skipped bytes.
+            if Self.shouldReconnectForForwardSeek(
+                curPosition: curPosition,
+                frontier: frontier,
+                connRangeEnd: rangeEnd,
+                endedPlanned: ended && (endedByBackpressure || endedByRangeEnd),
+                repositionedForPlayback: repositionedForPlayback
+            ) {
+                playbackRepositionPending = false
                 winCond.unlock()
                 // Far-forward seek. Serve from the detour cache ONLY if the block is already
                 // resident (e.g. the moov region the parser revisits); a genuine forward scrub
@@ -2990,6 +3060,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 timedReconnect(seek: true, at: curPosition)
                 continue
             }
+            playbackRepositionPending = false
 
             if !ended {
                 // Wait for the live connection to fill forward. A false return
@@ -3040,10 +3111,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // here looks like a transcode respawn to the host). Without this the end would
             // spend the give-up budget on a healthy link.
             if endedByBackpressure {
-                EngineLog.emit(
-                    "[AVIOReader] \(label) window drained after backpressure end; re-requesting at \(frontier)",
-                    category: .demux)
-                timedReconnect(seek: false, at: frontier)
+                // SVPlayer modification (2026-11-25): If a forward seek moved past `frontier`,
+                // re-anchor directly at `curPosition` instead of fetching skipped bytes.
+                if !isLive, curPosition > frontier {
+                    timedReconnect(seek: true, at: curPosition)
+                } else {
+                    EngineLog.emit(
+                        "[AVIOReader] \(label) window drained after backpressure end; re-requesting at \(frontier)",
+                        category: .demux)
+                    timedReconnect(seek: false, at: frontier)
+                }
                 continue
             }
             // #220: the range was delivered in full and the window has now drained, which is
@@ -3051,7 +3128,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // nothing failed, and spending the give-up budget on range boundaries would kill
             // the reader on a healthy link.
             if endedByRangeEnd {
-                timedReconnect(seek: false, at: frontier)
+                // SVPlayer modification (2026-11-25): Jump straight to `curPosition` when ahead of `frontier`.
+                if !isLive, curPosition > frontier {
+                    timedReconnect(seek: true, at: curPosition)
+                } else {
+                    timedReconnect(seek: false, at: frontier)
+                }
                 continue
             }
             // A 429/503/509 is rate limiting, not a dead source: drive give-up + backoff off the
@@ -3083,7 +3165,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             backoffBeforeReconnect(streak: repinned ? 0 : backoffStreak, retryAfter: retryAfter,
                                    isRateLimited: isRateLimited)
             diag.recordBackoff(ms: msSince(backoffStart))
-            timedReconnect(seek: false, at: frontier)
+            // SVPlayer modification (2026-11-25): After error backoff, resume at `curPosition` if
+            // a non-live seek moved ahead of `frontier` so skipped bytes are not re-fetched.
+            let reconnectAt = (!isLive && curPosition > frontier) ? curPosition : frontier
+            timedReconnect(seek: false, at: reconnectAt)
         }
 
         return Int32(totalRead)
@@ -3113,7 +3198,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.lock()
         nextFaultedRefillAt = .distantPast
         winCond.unlock()
-        startPersistentConnection(at: offset)
+        // SVPlayer modification (2026-11-25): Mark seek reconnects so the first range fits
+        // cleanly inside `winHighWater` (`seekInitialRangeBytes`) for faster refill & Keep-Alive.
+        startPersistentConnection(at: offset, isSeek: true)
     }
 
     /// Increments the unproductive-reconnect streak (resets if progress exceeded
@@ -4158,7 +4245,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Open a fresh Range: bytes=<offset>- connection (live: always `bytes=0-`, see the
     /// request construction below). Bumps generation so late callbacks from the old
     /// connection are ignored.
-    private func startPersistentConnection(at target: Int64, boundedTo: Int64? = nil, openEnded: Bool = false) {
+    private func startPersistentConnection(
+        at target: Int64,
+        boundedTo: Int64? = nil,
+        openEnded: Bool = false,
+        isSeek: Bool = false
+    ) {
         winCond.lock()
         connGeneration &+= 1
         let generation = connGeneration
@@ -4176,6 +4268,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 rangeProbe = RangeHonestyProbe(generation: generation, start: offset, expected: held)
             }
         }
+        // SVPlayer modification (2026-11-25): Measure undrained bytes that will remain in the
+        // sliding window across a continuation so `vodPersistentRequestRangeBytes` caps the Range
+        // request to the available `winHighWater` headroom and preserves HTTP/1.1 Keep-Alive.
+        let isContinuation = target >= winStart && target <= winStart + Int64(window.count)
+        let keptWindowCount = isContinuation ? Int(target - winStart) : 0
+        let keptUndrainedBytes = isContinuation ? max(0, keptWindowCount - max(0, Int(position - winStart))) : 0
         // #220: VOD asks for a fixed amount at a time, and anything an origin delivers past it is
         // dropped at the append (audit DMX-1), so the window is bounded by the ask. Two
         // cases keep the open-ended form: live, where the material is produced in real time so
@@ -4192,14 +4290,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             guard !openEnded else { return nil }
             guard !heldConnectionEnabled else { return nil }
             guard !isLive else { return nil }
-            // fileSize is still 0 on the very first connection, since the response's
-            // Content-Range is what resolves it. Asking for a fixed amount anyway is both safe
-            // and necessary: safe because a server clamps a range that overruns the file (416
-            // needs the START past the end, which cannot happen here), and necessary because
-            // waiting for a resolved size would leave the first connection, the one that reads
-            // from byte zero, open-ended.
-            if fileSize > offset { return min(Self.persistentRangeBytes, fileSize - offset) }
-            return fileSize <= 0 ? Self.persistentRangeBytes : nil
+            // SVPlayer modification (2026-11-25): Bound VOD ranges to `winHighWater` headroom (or
+            // `seekInitialRangeBytes` on seeks) so responses finish cleanly without backpressure
+            // cancellation tearing down warm Keep-Alive sockets.
+            return Self.vodPersistentRequestRangeBytes(
+                offset: offset,
+                target: target,
+                fileSize: fileSize,
+                winHighWater: winHighWater,
+                keptUndrainedBytes: keptUndrainedBytes,
+                isSeek: isSeek
+            )
         }()
         // #295: a request that begins inside the resident window, or exactly at its end, is a
         // CONTINUATION rather than a reposition. Resetting `winStart` to it dropped every byte
